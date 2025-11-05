@@ -4,13 +4,15 @@ import torch.nn as nn
 import timm
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+import os
 
 # 关键：从你修改过的本地文件导入模型
 from deit_modified import deit_small_patch16_224
+from vision_transformer_modified import MaskedAttention
 
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100  # ImageNet100
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 LEARNING_RATE = 0.01
 EPOCHS = 50 # 论文中DeiT的训练轮数
 LAMBDA_SP = 0.01 # 稀疏性损失权重 (需要调试)
@@ -19,6 +21,11 @@ LAMBDA_SM = 0.01 # 平滑性损失权重 (需要调试)
 # --- 2. 准备数据集 (ImageNet100) ---
 IMAGENET_SUBSET_TRAIN_PATH = "/root/autodl-tmp/imagenet100"
 IMAGENET_SUBSET_VAL_PATH = "/root/autodl-tmp/imagenet100_val" # 验证集路径
+
+print(f"正在加载 {NUM_CLASSES} 类 ImageNet 子集...")
+if not os.path.exists(IMAGENET_SUBSET_TRAIN_PATH):
+    print(f"错误: 路径 '{IMAGENET_SUBSET_TRAIN_PATH}' 不存在。请修改 main_phase1.py 中的路径。")
+    exit()
 
 transform_train = transforms.Compose([
     transforms.Resize(256),
@@ -38,57 +45,111 @@ transform_val = transforms.Compose([
 # 加载训练集
 train_dataset = datasets.ImageFolder(IMAGENET_SUBSET_TRAIN_PATH, transform=transform_train)
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-
+print(f"数据集加载完毕，共 {len(train_dataset)} 张训练图像。")
 # (如果需要) 加载验证集
 val_dataset = datasets.ImageFolder(IMAGENET_SUBSET_VAL_PATH, transform=transform_val)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
-# --- 3. 加载模型并载入预训练权重 ---
-# 这是将预训练权重加载到修改后模型的标准方法
-# a. 创建一个标准的、未经修改的预训练模型
-base_model = timm.create_model('deit_small_patch16_224', pretrained=True, num_classes=NUM_CLASSES)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# b. 创建我们修改过的模型实例
-# 注意：你需要将num_classes传递进去
+# --- 3. 加载SCFP可靠性得分 ---
+print("加载SCFP可靠性得分...")
+SCFP_SCORES_FILE = f'scfp_head_scores_deit_small_patch16_224_100class.pt'
+if not os.path.exists(SCFP_SCORES_FILE):
+    raise FileNotFoundError(f"SCFP得分文件 {SCFP_SCORES_FILE} 不存在。请先运行 compute_scfp_scores.py。")
+
+delta_f_scores = torch.load(SCFP_SCORES_FILE, map_location='cpu')
+epsilon = 1e-8 # 防止除以零
+print(f"成功加载 {len(delta_f_scores)} 个头的SCFP得分。")
+
+# --- 4. 加载模型并载入预训练权重 ---
+# 这是将预训练权重加载到修改后模型的标准方法
+print("正在加载模型...")
+# a. 创建一个标准的、未经修改的预训练模型 (1000类)
+base_model = timm.create_model('deit_small_patch16_224', pretrained=True)
+
+# b. 创建我们修改过的模型实例 (100类)
 model = deit_small_patch16_224(pretrained=False, num_classes=NUM_CLASSES)
 
-# c. 加载权重 (忽略我们新增的mask)
+# c. 加载权重 (忽略我们新增的mask和1000类->100类的分类头)
 model.load_state_dict(base_model.state_dict(), strict=False)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 print("模型加载完毕。")
 
 
-# --- 4. 设置损失函数和优化器 ---
-def get_all_masks(model):
-    """辅助函数：从模型中找到所有掩码参数"""
-    for name, param in model.named_parameters():
-        if "explainability_mask" in name:
-            yield param
-
-def calculate_total_loss_phase1(model, outputs, labels, ce_loss_fn, lambda_sp, lambda_sm):
-    """计算第一阶段的总损失"""
+# --- 5. 设置损失函数和优化器 ---
+def calculate_total_loss_re_pruner(
+    model, 
+    outputs, 
+    labels, 
+    ce_loss_fn, 
+    lambda_sp, 
+    lambda_sm, 
+    scfp_scores, 
+    device, 
+    epsilon
+):
+    """
+    计算第一阶段的总损失，使用基于SCFP的自适应稀疏正则化 (RE-Pruner)。
+    """
     
     # 1. 交叉熵损失
     loss_ce = ce_loss_fn(outputs, labels)
     
-    # 2. 稀疏性损失 (L_sparse - Eq. 7)
-    loss_sparse = torch.tensor(0.0, device=loss_ce.device)
-    for mask in get_all_masks(model):
-        loss_sparse += torch.norm(mask, p=2) # L2 norm
+    loss_adaptive_sparse = torch.tensor(0.0, device=device)
+    loss_smooth = torch.tensor(0.0, device=device)
 
-    # 3. 平滑性损失 (L_smooth - Eq. 6)
-    # 这是一个简化的、可操作的实现，惩罚相邻类别掩码之间的差异
-    loss_smooth = torch.tensor(0.0, device=loss_ce.device)
-    for mask in get_all_masks(model):
-        # 沿类别维度计算差分
-        if mask.shape[0] > 1: # 确保类别数大于1
-            diff = mask[1:, ...] - mask[:-1, ...]
-            loss_smooth += torch.norm(diff, p=1) # L1 norm of differences
+    # 遍历模型中的所有Block
+    for block_idx, block in enumerate(model.blocks):
+        # 确保我们正在处理正确的模块
+        if isinstance(block.attn, MaskedAttention):
+            # 获取该Block中所有头的掩码张量
+            # 形状为: [num_classes, num_heads, head_dim]
+            mask_tensor = block.attn.explainability_mask 
+            
+            # 3. 平滑性损失 (L_smooth - Eq. 6) - 论文中的简化实现
+            if mask_tensor.shape[0] > 1: # 确保类别数大于1
+                diff = mask_tensor[1:, ...] - mask_tensor[:-1, ...]
+                loss_smooth += torch.norm(diff, p=1) # L1 norm of differences
+
+            # 2. 自适应稀疏性损失 (L_adaptive_sparse - 融合方案)
+            num_heads_in_block = mask_tensor.shape[1]
+            for head_idx in range(num_heads_in_block):
+                # 构建SCFP得分文件中的key
+                scfp_key = f'blocks.{block_idx}.attn.head.{head_idx}'
+                
+                if scfp_key in scfp_scores:
+                    delta_F_i = scfp_scores[scfp_key]
+                    
+                    # 可靠性越低，惩罚权重越高。
+                    delta_F_i_tensor = torch.tensor(delta_F_i, device=device)
+                    
+                    # 惩罚权重 (基于费舍尔信息正则化)
+                    penalty_weight = 1.0 / (torch.abs(delta_F_i_tensor) + epsilon)
+                    
+                    # 提取这个特定头的掩码 (跨所有类别)
+                    # 形状: [num_classes, head_dim]
+                    head_mask = mask_tensor[:, head_idx, :]
+                    
+                    # 计算L2范数并施加惩罚
+                    loss_adaptive_sparse += penalty_weight * torch.norm(head_mask, p=2)
+                
+                else:
+                    # 如果由于某种原因找不到分数，打印警告
+                    print(f"警告: 找不到 {scfp_key} 的SCFP分数。将不应用稀疏惩罚。")
+                    
+    # [注意]：此实现仅惩罚了Attention Head。
+    # 如果您的 `vision_transformer_modified.py` 也为MLP层添加了掩码，
+    # 您需要在这里添加对它们的处理 (例如，使用原始的、未加权的稀疏惩罚)
+    for name, param in model.named_parameters():
+        if "mlp_mask" in name:
+            loss_adaptive_sparse += torch.norm(param, p=2) # 示例：添加原始的L2惩罚
 
     # 总损失
-    total_loss = loss_ce + lambda_sp * loss_sparse + lambda_sm * loss_smooth
-    return total_loss
+    total_loss = loss_ce + lambda_sp * loss_adaptive_sparse + lambda_sm * loss_smooth
+    
+    return total_loss, loss_ce, loss_adaptive_sparse, loss_smooth
+# --- RE-Pruner: 结束 ---
 
 # 冻结模型原始权重
 for name, param in model.named_parameters():
@@ -105,7 +166,8 @@ for name, param in model.named_parameters():
 optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE, momentum=0.9)
 ce_loss_fn = nn.CrossEntropyLoss()
 
-# --- 5. 训练循环 ---
+# --- 6. 训练循环 ---
+print("--- 开始第一阶段 (RE-Pruner 掩码学习) ---")
 model.train()
 for epoch in range(EPOCHS):
     for i, (images, labels) in enumerate(train_loader):
@@ -116,21 +178,34 @@ for epoch in range(EPOCHS):
         # 将标签传递给模型
         outputs = model(images, y_labels=labels)
         
-        loss = calculate_total_loss_phase1(model, outputs, labels, ce_loss_fn, LAMBDA_SP, LAMBDA_SM)
+        # --- RE-Pruner: 调用新的损失函数 ---
+        loss, loss_c, loss_as, loss_s = calculate_total_loss_re_pruner(
+            model, 
+            outputs, 
+            labels, 
+            ce_loss_fn, 
+            LAMBDA_SP, 
+            LAMBDA_SM,
+            delta_f_scores, # 传入加载的分数
+            device,         
+            epsilon         
+        )
         
         loss.backward()
         optimizer.step()
         
         if i % 50 == 0:
-            print(f"Epoch [{epoch+1}/{EPOCHS}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
+            print(f"Epoch [{epoch+1}/{EPOCHS}], Step [{i+1}/{len(train_loader)}], Total Loss: {loss.item():.4f}")
+            print(f"  -> CE Loss: {loss_c.item():.4f}, Adaptive Sparse Loss: {loss_as.item():.4f}, Smooth Loss: {loss_s.item():.4f}")
 
-print("第一阶段训练完成!")
+print("第一阶段 (RE-Pruner) 训练完成!")
 
 
 # 保存训练好的掩码权重
 
 
-output_filename = "deit_small_phase1_masks_cifar10.pth"
+# 保存训练好的掩码权重
+output_filename = f"re_pruner_phase1_masks_{NUM_CLASSES}class.pth"
 print(f"正在将模型状态保存到: {output_filename} ...")
 torch.save(model.state_dict(), output_filename)
 print("保存成功！")
