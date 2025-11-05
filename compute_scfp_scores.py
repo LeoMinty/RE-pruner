@@ -9,8 +9,10 @@ import os
 
 # --- 1. 配置 ---
 # 必须：设置您的ImageNet训练集路径
-IMAGENET_TRAIN_PATH = r'F:\数据集\train' 
+IMAGENET_TRAIN_PATH = "/root/autodl-tmp/imagenet100" 
 # IMAGENET_TRAIN_PATH = "./data/imagenet/train" # 假设的路径
+
+NUM_CLASSES = 100
 
 # 模型参数 (deit_small)
 MODEL_NAME = 'deit_small_patch16_224'
