@@ -9,7 +9,7 @@ from deit_modified import deit_small_patch16_224
 from vision_transformer_modified import MaskedAttention # 导入用于类型检查
 
 # --- 1. 定义超参数和配置 ---
-NUM_CLASSES = 10
+NUM_CLASSES = 100
 BATCH_SIZE = 128
 EPOCHS = 80 # 论文中DeiT的剪枝训练轮数
 ALPHA_TARGET = 0.2 # 目标总剪枝率
@@ -18,13 +18,32 @@ ALPHA_TARGET = 0.2 # 目标总剪枝率
 MODEL_STATE_PATH = "deit_small_phase1_masks_cifar10.pth"
 
 # --- 2. 准备数据集 (与第一阶段相同) ---
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+IMAGENET_SUBSET_TRAIN_PATH = "/root/autodl-tmp/imagenet100"
+IMAGENET_SUBSET_VAL_PATH = "/root/autodl-tmp/imagenet100_val" # 验证集路径
+
+transform_train = transforms.Compose([
+    transforms.Resize(256),
+    transforms.RandomCrop(224), # 使用RandomCrop进行训练
+    transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
-train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+transform_val = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# 加载训练集
+train_dataset = datasets.ImageFolder(IMAGENET_SUBSET_TRAIN_PATH, transform=transform_train)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+
+# (如果需要) 加载验证集
+val_dataset = datasets.ImageFolder(IMAGENET_SUBSET_VAL_PATH, transform=transform_val)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- 3. 加载模型并切换到剪枝模式 ---

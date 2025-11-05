@@ -9,25 +9,42 @@ from torch.utils.data import DataLoader
 from deit_modified import deit_small_patch16_224
 
 # --- 1. 定义超参数和配置 ---
-NUM_CLASSES = 10  # 先以CIFAR-10为例
+NUM_CLASSES = 100  # ImageNet100
 BATCH_SIZE = 128
 LEARNING_RATE = 0.01
 EPOCHS = 50 # 论文中DeiT的训练轮数
 LAMBDA_SP = 0.01 # 稀疏性损失权重 (需要调试)
 LAMBDA_SM = 0.01 # 平滑性损失权重 (需要调试)
 
-# --- 2. 准备数据集 (CIFAR-10) ---
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+# --- 2. 准备数据集 (ImageNet100) ---
+IMAGENET_SUBSET_TRAIN_PATH = "/root/autodl-tmp/imagenet100"
+IMAGENET_SUBSET_VAL_PATH = "/root/autodl-tmp/imagenet100_val" # 验证集路径
+
+transform_train = transforms.Compose([
+    transforms.Resize(256),
+    transforms.RandomCrop(224), # 使用RandomCrop进行训练
+    transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
-    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
-train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+transform_val = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# 加载训练集
+train_dataset = datasets.ImageFolder(IMAGENET_SUBSET_TRAIN_PATH, transform=transform_train)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+
+# (如果需要) 加载验证集
+val_dataset = datasets.ImageFolder(IMAGENET_SUBSET_VAL_PATH, transform=transform_val)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
 # --- 3. 加载模型并载入预训练权重 ---
 # 这是将预训练权重加载到修改后模型的标准方法
-print("正在加载模型...")
 # a. 创建一个标准的、未经修改的预训练模型
 base_model = timm.create_model('deit_small_patch16_224', pretrained=True, num_classes=NUM_CLASSES)
 
