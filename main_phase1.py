@@ -66,7 +66,7 @@ print(f"成功加载 {len(delta_f_scores)} 个头的SCFP得分。")
 # 这是将预训练权重加载到修改后模型的标准方法
 print("正在加载模型...")
 # a. 创建一个标准的、未经修改的预训练模型 (1000类)
-base_model = timm.create_model('deit_small_patch16_224', pretrained=True)
+base_model = timm.create_model('deit_small_patch16_224', pretrained=True, num_classes=NUM_CLASSES)
 
 # b. 创建我们修改过的模型实例 (100类)
 model = deit_small_patch16_224(pretrained=False, num_classes=NUM_CLASSES)
