@@ -13,12 +13,12 @@ from vision_transformer_modified import MaskedAttention # 导入用于类型检�
 
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 EPOCHS = 10 # 减少epochs用于测试
 ALPHA_TARGET = 0.2 # 目标总剪枝率
 
 # 模型状态文件路径
-MODEL_STATE_PATH = "deit_small_phase1_masks_cifar10.pth"
+MODEL_STATE_PATH = "re_pruner_phase1_masks_100class.pth"
 
 # --- 2. 准备数据集 (与第一阶段相同) ---
 IMAGENET_SUBSET_TRAIN_PATH = "/root/autodl-tmp/imagenet100"
