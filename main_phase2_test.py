@@ -66,15 +66,15 @@ model.load_state_dict(torch.load(MODEL_STATE_PATH, map_location=device), strict=
 model.to(device)
 print("加载成功！")
 
-print("正在强制重新初始化剪枝参数 (r_logit)...")
-with torch.no_grad(): # 确保此操作不被跟踪
+print("正在强制重新初始化剪枝参数 (theta)...")
+with torch.no_grad(): 
     for module in model.modules():
         if isinstance(module, MaskedAttention):
-            # 重新初始化 r_logit 为一个小的负数
-            # sigmoid(-2.0) ≈ 0.119, 这样初始 loss_r != 0
-            module.r_logit.data = torch.tensor([-2.0], device=device)
-            # 也可以初始化 theta，尽管0.0是合理的
-            module.theta.data = torch.tensor([0.0], device=device)
+            # 将 theta 初始化为 0.0
+            # 初始时，约一半分数 > 0, 一半 < 0, R 约为 0.5
+            # 如果掩码分数大多为正，theta=0.0 会导致 R 接近 0
+            # 我们可以根据第一阶段掩码的均值来设置初始theta，但 0.0 是一个合理的起点
+            module.theta.data = torch.tensor([0.0], device=device) 
 print("剪枝参数初始化完毕。")
 
 # 关键：激活所有MaskedAttention模块的剪枝模式
@@ -91,23 +91,37 @@ ce_loss_fn = nn.CrossEntropyLoss()
 
 def calculate_pruning_loss_simple(model, alpha_target, total_prunable_elements):
     """计算一个简单的、稳定的二次惩罚剪枝损失"""
-    current_R = torch.tensor(0.0, device=device)
-    total_elements_processed = 0
+    n = 10.0
+    current_pruned_elements = torch.tensor(0.0, device=device)
+    total_elements = 0.0
     for module in model.modules():
         if isinstance(module, MaskedAttention):
-            r = torch.sigmoid(module.r_logit)
-            num_elements_in_module = module.explainability_mask.numel()
-            current_R += (r * num_elements_in_module).sum()
-            total_elements_processed += num_elements_in_module
-    if total_elements_processed == 0:
-        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
-    
-    # 计算加权平均剪枝率
-    current_R_avg = current_R / total_elements_processed
+            # 注意：这里我们使用 .data 来获取掩码分数，
+            # 因为我们不希望在计算损失时跟踪掩码本身的梯度
+            # 掩码在第一阶段已经训练完毕
+            mask_scores = module.explainability_mask.data
+            theta = module.theta # theta 是可学习的
+            
+            # (1 - 门控因子) ≈ 剪枝概率
+            # 门控因子 = 0.5 * (tanh(n * (M - theta)) + 1)
+            # 剪枝概率 ≈ 1.0 - 0.5 * (tanh(n * (M - theta)) + 1)
+            #           = 0.5 * (1.0 - tanh(n * (M - theta)))
+            # 这是可微分的
+            pruned_probability = 0.5 * (1.0 - torch.tanh(n * (mask_scores - theta)))
+            
+            # 累加预期被剪掉的元素数量
+            current_pruned_elements += pruned_probability.sum()
+            total_elements += mask_scores.numel()
 
-    # 核心修改：使用二次惩罚
+    if total_elements == 0:
+        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+
+    # R 是 (预期剪枝元素 / 总元素)
+    current_R_avg = current_pruned_elements / total_elements 
+    
+    # 损失是 R 与目标的L2距离
     loss_r = (current_R_avg - alpha_target)**2
-    return loss_r, current_R_avg # 同时返回current_R_avg用于监控
+    return loss_r, current_R_avg
 
 # --- 关键：为不同参数组设置不同的优化器和学习率 ---
 # a. 冻结第一阶段学到的掩码分数
@@ -116,7 +130,7 @@ model_weights = []
 for name, param in model.named_parameters():
     if "explainability_mask" in name:
         param.requires_grad = False
-    elif "r_logit" in name or "theta" in name:
+    elif "theta" in name:
         pruning_params.append(param)
     else:
         model_weights.append(param)
@@ -127,7 +141,8 @@ optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.02)
 
 print(f"模型权重参数组大小: {len(model_weights)}")
 print(f"剪枝参数组大小: {len(pruning_params)}")
-
+if not pruning_params:
+    print("警告：未找到名为 'theta' 的剪枝参数。请检查 'vision_transformer_modified.py'。")
 
 # --- 5. 第二阶段训练循环 ---
 model.train()
