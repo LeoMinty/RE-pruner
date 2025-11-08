@@ -93,7 +93,7 @@ class MaskedAttention(nn.Module):
         self.explainability_mask = nn.Parameter(torch.ones(num_classes, num_heads, head_dim))
 
         # --- 新增：为剪枝阶段创建可学习参数 ---
-        self.r_logit = nn.Parameter(torch.zeros(1)) # sigmoid(r_logit) -> 剪枝率 r
+        self.r_logit = nn.Parameter(torch.tensor([-2.0])) # sigmoid(r_logit) -> 剪枝率 r
         self.theta = nn.Parameter(torch.zeros(1))   # 剪枝阈值 theta
         self.is_pruning_phase = False # 一个开关，用于区分不同阶段
 

@@ -66,6 +66,17 @@ model.load_state_dict(torch.load(MODEL_STATE_PATH, map_location=device), strict=
 model.to(device)
 print("加载成功！")
 
+print("正在强制重新初始化剪枝参数 (r_logit)...")
+with torch.no_grad(): # 确保此操作不被跟踪
+    for module in model.modules():
+        if isinstance(module, MaskedAttention):
+            # 重新初始化 r_logit 为一个小的负数
+            # sigmoid(-2.0) ≈ 0.119, 这样初始 loss_r != 0
+            module.r_logit.data = torch.tensor([-2.0], device=device)
+            # 也可以初始化 theta，尽管0.0是合理的
+            module.theta.data = torch.tensor([0.0], device=device)
+print("剪枝参数初始化完毕。")
+
 # 关键：激活所有MaskedAttention模块的剪枝模式
 num_prunable_elements = 0
 for module in model.modules():
@@ -81,11 +92,12 @@ ce_loss_fn = nn.CrossEntropyLoss()
 def calculate_pruning_loss_simple(model, alpha_target, total_prunable_elements):
     """计算一个简单的、稳定的二次惩罚剪枝损失"""
     current_R = torch.tensor(0.0, device=device)
+    total_elements_processed = 0
     for module in model.modules():
         if isinstance(module, MaskedAttention):
             r = torch.sigmoid(module.r_logit)
             num_elements_in_module = module.explainability_mask.numel()
-            current_R += (r * num_elements_in_module)
+            current_R += (r * num_elements_in_module).sum()
             total_elements_processed += num_elements_in_module
     if total_elements_processed == 0:
         return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
