@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 
 from torch.utils.data import Subset
 import numpy as np
-
+import os
 # 关键：从你修改过的本地文件导入模型
 from deit_modified import deit_small_patch16_224
 from vision_transformer_modified import MaskedAttention # 导入用于类型检查
@@ -15,7 +15,7 @@ from vision_transformer_modified import MaskedAttention # 导入用于类型检�
 NUM_CLASSES = 100
 BATCH_SIZE = 64
 EPOCHS = 10 # 减少epochs用于测试
-ALPHA_TARGET = 0.2 # 目标总剪枝率
+ALPHA_TARGET = 0.5 # 目标总剪枝率
 
 # 模型状态文件路径
 MODEL_STATE_PATH = "re_pruner_phase1_masks_100class.pth"
@@ -24,15 +24,8 @@ MODEL_STATE_PATH = "re_pruner_phase1_masks_100class.pth"
 IMAGENET_SUBSET_TRAIN_PATH = "/root/autodl-tmp/imagenet100"
 IMAGENET_SUBSET_VAL_PATH = "/root/autodl-tmp/imagenet100_val" # 验证集路径
 
-transform_train = transforms.Compose([
-    transforms.Resize(256),
-    transforms.RandomCrop(224), # 使用RandomCrop进行训练
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
 
-transform_val = transforms.Compose([
+transform = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
@@ -40,15 +33,11 @@ transform_val = transforms.Compose([
 ])
 
 # 加载训练集
-train_dataset = datasets.ImageFolder(IMAGENET_SUBSET_TRAIN_PATH, transform=transform_train)
+train_dataset = datasets.ImageFolder(IMAGENET_SUBSET_TRAIN_PATH, transform=transform)
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
 
-# (如果需要) 加载验证集
-val_dataset = datasets.ImageFolder(IMAGENET_SUBSET_VAL_PATH, transform=transform_val)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-
 # 首先，加载完整的训练集
-full_train_dataset = train_loader
+full_train_dataset = datasets.ImageFolder(IMAGENET_SUBSET_TRAIN_PATH, transform=transform)
 
 # --- 新增：创建数据集的子集 ---
 subset_percentage = 0.1 # 使用10%的数据进行快速调试
@@ -71,6 +60,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # --- 3. 加载模型并切换到剪枝模式 ---
 model = deit_small_patch16_224(pretrained=False, num_classes=NUM_CLASSES)
 print(f"正在从 {MODEL_STATE_PATH} 加载模型状态...")
+if not os.path.exists(MODEL_STATE_PATH):
+    raise FileNotFoundError(f"模型文件 {MODEL_STATE_PATH} 不存在。请检查第一阶段是否已成功运行。")
 model.load_state_dict(torch.load(MODEL_STATE_PATH, map_location=device), strict=False)
 model.to(device)
 print("加载成功！")
@@ -81,13 +72,11 @@ for module in model.modules():
     if isinstance(module, MaskedAttention):
         module.is_pruning_phase = True
         num_prunable_elements += module.explainability_mask.numel()
+print(f"总可剪枝参数元素 (来自掩码): {num_prunable_elements}")
 
 # --- 4. 设置损失函数和优化器 ---
 ce_loss_fn = nn.CrossEntropyLoss()
 
-# 新增：用于L_R损失的可学习参数
-# beta = nn.Parameter(torch.tensor(0.0, device=device))
-# gamma = nn.Parameter(torch.tensor(0.0, device=device))
 
 def calculate_pruning_loss_simple(model, alpha_target, total_prunable_elements):
     """计算一个简单的、稳定的二次惩罚剪枝损失"""
@@ -96,11 +85,17 @@ def calculate_pruning_loss_simple(model, alpha_target, total_prunable_elements):
         if isinstance(module, MaskedAttention):
             r = torch.sigmoid(module.r_logit)
             num_elements_in_module = module.explainability_mask.numel()
-            current_R += ((r * num_elements_in_module) / total_prunable_elements).sum()
+            current_R += (r * num_elements_in_module)
+            total_elements_processed += num_elements_in_module
+    if total_elements_processed == 0:
+        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+    
+    # 计算加权平均剪枝率
+    current_R_avg = current_R / total_elements_processed
 
     # 核心修改：使用二次惩罚
-    loss_r = (current_R - alpha_target)**2
-    return loss_r, current_R # 同时返回current_R用于监控
+    loss_r = (current_R_avg - alpha_target)**2
+    return loss_r, current_R_avg # 同时返回current_R_avg用于监控
 
 # --- 关键：为不同参数组设置不同的优化器和学习率 ---
 # a. 冻结第一阶段学到的掩码分数
@@ -114,9 +109,6 @@ for name, param in model.named_parameters():
     else:
         model_weights.append(param)
 
-# 添加beta和gamma到模型权重组
-# model_weights.append(beta)
-# model_weights.append(gamma)
         
 optimizer_weights = torch.optim.AdamW(model_weights, lr=5e-4)
 optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.02)
@@ -161,7 +153,7 @@ for epoch in range(EPOCHS):
 
 print("第二阶段训练完成!")
 # 保存最终的剪枝模型
-output_filename = "deit_small_phase2_pruned_test.pth"
+output_filename = f"re_pruner_phase2_pruned_test_{NUM_CLASSES}class.pth"
 print(f"正在将模型状态保存到: {output_filename} ...")
 torch.save(model.state_dict(), output_filename)
 print("保存成功！")
