@@ -45,13 +45,20 @@ val_dataset = datasets.ImageFolder(IMAGENET_SUBSET_VAL_PATH, transform=transform
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+print(f"数据集加载完毕，共 {len(train_dataset)} 张训练图像。")
 # --- 3. 加载模型并切换到剪枝模式 ---
 model = deit_small_patch16_224(pretrained=False, num_classes=NUM_CLASSES)
 print(f"正在从 {MODEL_STATE_PATH} 加载模型状态...")
 model.load_state_dict(torch.load(MODEL_STATE_PATH, map_location=device), strict=False)
 model.to(device)
 print("加载成功！")
+
+print("正在强制重新初始化剪枝参数 (theta)...")
+with torch.no_grad(): 
+    for module in model.modules():
+        if isinstance(module, MaskedAttention):
+            module.theta.data = torch.tensor([0.0], device=device)
+print("剪枝参数初始化完毕。")
 
 # 关键：激活所有MaskedAttention模块的剪枝模式
 num_prunable_elements = 0
@@ -60,6 +67,8 @@ for module in model.modules():
         module.is_pruning_phase = True
         num_prunable_elements += module.explainability_mask.numel()
 
+print(f"总可剪枝参数元素 (来自掩码): {num_prunable_elements}")
+
 # --- 4. 设置损失函数和优化器 ---
 ce_loss_fn = nn.CrossEntropyLoss()
 
@@ -67,17 +76,29 @@ ce_loss_fn = nn.CrossEntropyLoss()
 beta = nn.Parameter(torch.tensor(0.0, device=device))
 gamma = nn.Parameter(torch.tensor(0.0, device=device))
 
-def calculate_pruning_loss(model, alpha_target, total_prunable_elements, beta, gamma):
+def calculate_pruning_loss(model, alpha_target, total_prunable_elements):
     """计算剪枝率正则化损失 L_R (Eq. 10, 11)"""
-    current_R = torch.tensor(0.0, device=device)
+    n = 10.0
+    current_pruned_elements = torch.tensor(0.0, device=device)
+    total_elements = 0.0
     for module in model.modules():
         if isinstance(module, MaskedAttention):
-            r = torch.sigmoid(module.r_logit)
-            num_elements_in_module = module.explainability_mask.numel()
-            current_R += ((r * num_elements_in_module) / total_prunable_elements).sum()
-    
-    loss_r = beta * (alpha_target - current_R)**2 + gamma * (alpha_target - current_R)
-    return loss_r
+            # 掩码分数在第一阶段已固定，不跟踪其梯度
+            mask_scores = module.explainability_mask.data
+            theta = module.theta # theta 是可学习的
+            
+            # (1 - 门控因子) ≈ 剪枝概率
+            pruned_probability = 0.5 * (1.0 - torch.tanh(n * (mask_scores - theta)))
+            
+            current_pruned_elements += pruned_probability.sum()
+            total_elements += mask_scores.numel()
+
+    if total_elements == 0:
+        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+
+    current_R_avg = current_pruned_elements / total_elements
+    loss_r = (current_R_avg - alpha_target)**2
+    return loss_r, current_R_avg
 
 # --- 关键：为不同参数组设置不同的优化器和学习率 ---
 # a. 冻结第一阶段学到的掩码分数
@@ -86,7 +107,7 @@ model_weights = []
 for name, param in model.named_parameters():
     if "explainability_mask" in name:
         param.requires_grad = False
-    elif "r_logit" in name or "theta" in name:
+    elif "theta" in name:
         pruning_params.append(param)
     else:
         model_weights.append(param)
@@ -100,7 +121,8 @@ optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.02)
 
 print(f"模型权重参数组大小: {len(model_weights)}")
 print(f"剪枝参数组大小: {len(pruning_params)}")
-
+if not pruning_params:
+    print("警告：未找到名为 'theta' 的剪枝参数。请检查 'vision_transformer_modified.py'。")
 
 # --- 5. 第二阶段训练循环 ---
 model.train()
@@ -138,7 +160,7 @@ for epoch in range(EPOCHS):
 
 print("第二阶段训练完成!")
 # 保存最终的剪枝模型
-output_filename = "deit_small_phase2_pruned.pth"
+output_filename = f"re_pruner_phase2_pruned_formal_theta_{NUM_CLASSES}class_r{ALPHA_TARGET}.pth"
 print(f"正在将模型状态保存到: {output_filename} ...")
 torch.save(model.state_dict(), output_filename)
 print("保存成功！")
