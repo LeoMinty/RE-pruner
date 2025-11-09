@@ -97,7 +97,7 @@ class MaskedAttention(nn.Module):
         self.theta = nn.Parameter(torch.zeros(1))   # 剪枝阈值 theta
         self.is_pruning_phase = False # 一个开关，用于区分不同阶段
 
-    def forward(self, x, y_labels, attn_mask = None):
+    def forward(self, x, y_labels=None, attn_mask = None):
         # x: input tensor
         # y_labels: ground truth labels for the current batch, shape (batch_size,)
         
@@ -119,18 +119,28 @@ class MaskedAttention(nn.Module):
         x_attn = (attn @ v)
         
         # --- 根据阶段选择不同的掩码 ---
+        if y_labels is not None:
+            # --- 阶段 1: 掩码学习 (传入了 y_labels) ---
+            # 使用与类别相关的掩码分数
+            mask_scores = self.explainability_mask[y_labels] # Shape [B, num_heads, head_dim]
+        else:
+            # --- 阶段 2 或 3: (y_labels is None) ---
+            # 使用 "类无关" 的掩码分数 (在所有类别上取平均)
+            # 这代表了每个单元的 "通用重要性"
+            # Shape: [num_heads, head_dim]
+            avg_mask_scores = torch.mean(self.explainability_mask, dim=0) 
+            
+            # 扩展维度以匹配 x_attn 的批次大小
+            # Shape: [B, num_heads, head_dim]
+            mask_scores = avg_mask_scores.unsqueeze(0).expand(B, -1, -1)
 
-        # 根据标签索引对应的掩码
-        # mask_for_batch 的形状: (B, num_heads, head_dim)
-        mask_scores = self.explainability_mask[y_labels]
-
+        # --- 剪枝阶段应用 ---
         if self.is_pruning_phase:
-            # 第二阶段：应用可微分剪枝操作
+            # 阶段 2: 应用可微分剪枝 (仍然使用 "类无关" 的 mask_scores)
             final_mask = differentiable_pruning_operation(mask_scores, self.r_logit, self.theta)
         else:
-            # 第一阶段或推理阶段：直接使用分数
-            final_mask = mask_scores
-        
+            # 阶段 1 或 3: 直接使用掩码
+            final_mask = mask_scores      
         
         # 调整mask形状以进行广播: (B, num_heads, 1, head_dim)
         final_mask = final_mask.unsqueeze(2)
@@ -273,7 +283,7 @@ class Block(nn.Module):
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x: torch.Tensor, y_labels: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y_labels: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), y_labels=y_labels)))
         x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
         return x
@@ -1033,7 +1043,7 @@ class VisionTransformer(nn.Module):
             attn_mask=attn_mask,
         )
 
-    def forward_features(self, x: torch.Tensor, y_labels: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor, y_labels: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
         x = self.patch_embed(x)
         x = self._pos_embed(x)
@@ -1096,7 +1106,7 @@ class VisionTransformer(nn.Module):
         x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x: torch.Tensor, y_labels: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y_labels: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.forward_features(x, y_labels=y_labels, attn_mask=attn_mask)
         x = self.forward_head(x)
         return x

@@ -11,8 +11,8 @@ from vision_transformer_modified import MaskedAttention # 导入用于类型检�
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100
 BATCH_SIZE = 64
-EPOCHS = 80 # 论文中DeiT的剪枝训练轮数
-ALPHA_TARGET = 0.2 # 目标总剪枝率
+EPOCHS = 50 # 论文中DeiT的剪枝训练轮数
+ALPHA_TARGET = 0.5 # 目标总剪枝率
 
 # 模型状态文件路径
 MODEL_STATE_PATH = "re_pruner_phase1_masks_100class.pth"
@@ -58,7 +58,9 @@ with torch.no_grad():
     for module in model.modules():
         if isinstance(module, MaskedAttention):
             # 重新初始化 r_logit 为一个小的负数
+            # sigmoid(-2.0) ≈ 0.119, 这样初始 R ≈ 0.119
             module.r_logit.data = torch.tensor([-2.0], device=device)
+            # theta 也会被优化，但它在剪枝决策中不起作用
             module.theta.data = torch.tensor([0.0], device=device) 
 print("剪枝参数初始化完毕。")
 
@@ -137,7 +139,8 @@ for epoch in range(EPOCHS):
             gamma.data.clamp_(min=0)
         
         # 前向传播
-        outputs = model(images, y_labels=labels)
+        # 不再传入 y_labels，模型将使用类无关的平均掩码进行前向传播
+        outputs = model(images, y_labels=None)
         
         # 计算损失
         loss_ce = ce_loss_fn(outputs, labels)
