@@ -93,7 +93,7 @@ class MaskedAttention(nn.Module):
         self.explainability_mask = nn.Parameter(torch.ones(num_classes, num_heads, head_dim))
 
         # --- 新增：为剪枝阶段创建可学习参数 ---
-        # self.r_logit = nn.Parameter(torch.tensor([-2.0])) # sigmoid(r_logit) -> 剪枝率 r
+        self.r_logit = nn.Parameter(torch.zeros(1)) # sigmoid(r_logit) -> 剪枝率 r
         self.theta = nn.Parameter(torch.zeros(1))   # 剪枝阈值 theta
         self.is_pruning_phase = False # 一个开关，用于区分不同阶段
 
@@ -126,8 +126,7 @@ class MaskedAttention(nn.Module):
 
         if self.is_pruning_phase:
             # 第二阶段：应用可微分剪枝操作
-            # final_mask = differentiable_pruning_operation(mask_scores, self.r_logit, self.theta)
-            final_mask = differentiable_pruning_operation(mask_scores, self.theta)
+            final_mask = differentiable_pruning_operation(mask_scores, self.r_logit, self.theta)
         else:
             # 第一阶段或推理阶段：直接使用分数
             final_mask = mask_scores
@@ -145,31 +144,35 @@ class MaskedAttention(nn.Module):
         x_out = self.attn.proj_drop(x_proj)
         return x_out
 
-def differentiable_pruning_operation(mask_scores, theta, n=10.0):
+def differentiable_pruning_operation(mask_scores, r_logit, theta, n=10.0):
     """实现 Eq. 9 的核心思想,简化版,专注于保留top k"""
-    # r = torch.sigmoid(r_logit)
-    # flat_scores = mask_scores.flatten()
+    r = torch.sigmoid(r_logit)
 
-    # k = int((1.0 - r) * flat_scores.numel())
+    # 将分数展平以便排序
+    flat_scores = mask_scores.flatten()
 
-    # k = max(1, k) 
-    # top_k_threshold = torch.kthvalue(flat_scores, k).values
-    # is_important = mask_scores >= top_k_threshold
+    # 计算需要保留的元素数量 k
+    k = int((1.0 - r) * flat_scores.numel())
+    # 确保k至少为1，避免全部剪掉
+    k = max(1, k) 
 
-    # tanh_term = torch.tanh(n * (mask_scores - theta))
+    # 找到作为阈值的第k大的分数
+    top_k_threshold = torch.kthvalue(flat_scores, k).values
+
+    # 创建一个布尔掩码，标记重要单元 (大于等于阈值)
+    is_important = mask_scores >= top_k_threshold
+
+    # 应用tanh平滑函数，这是可微分的关键
+    # 对于不重要的单元，其值将被抑制趋近于0
+    # 对于重要的单元，其值将保持不变
+    tanh_term = torch.tanh(n * (mask_scores - theta)) # theta 在这里被使用但未返回
 
     # 只保留重要单元的分数，不重要的置零
-    # pruned_mask = torch.where(
-    #     is_important,
-    #     mask_scores, # 保留原始分数
-    #     torch.zeros_like(mask_scores) # 不重要的直接置零
-    # )
-
-    # 使用 0.5 * (tanh(...) + 1) 作为 (0, 1) 之间的 "软" 门控因子
-    # 当 (M - theta) >> 0, 因子 -> 1
-    # 当 (M - theta) << 0, 因子 -> 0
-    gating_factor = 0.5 * (torch.tanh(n * (mask_scores - theta)) + 1.0)
-    pruned_mask = mask_scores * gating_factor
+    pruned_mask = torch.where(
+        is_important,
+        mask_scores, # 保留原始分数
+        torch.zeros_like(mask_scores) # 不重要的直接置零
+    )
 
     return pruned_mask
 
