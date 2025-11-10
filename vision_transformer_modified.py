@@ -154,36 +154,46 @@ class MaskedAttention(nn.Module):
         x_out = self.attn.proj_drop(x_proj)
         return x_out
 
-def differentiable_pruning_operation(mask_scores, r_logit, theta, n=10.0):
-    """实现 Eq. 9 的核心思想,简化版,专注于保留top k"""
-    r = torch.sigmoid(r_logit)
+def differentiable_pruning_operation(mask_scores, r_logit, theta=None, n=10.0):
+    """
+    执行 *结构化* 剪枝 (按头剪枝)。
+    这仍然是 "逻辑" 剪枝 (乘以0)，但掩码现在是按头生成的。
+    
+    mask_scores shape: [B, num_heads, head_dim]
+    """
+    
+    # 1. 获取目标剪枝率 r (标量)
+    r = torch.sigmoid(r_logit).item() 
+    
+    # 2. 计算每个头的 "重要性分数"
+    # 我们通过在 B 和 D_h 维度上求均值/总和来得到每个头的分数
+    # 使用 .data 来防止这一步影响 mask_scores 的梯度 (只让 r_logit 学习)
+    head_importance = mask_scores.data.mean(dim=0).sum(dim=1) # Shape: [num_heads]
+    
+    num_heads = head_importance.shape[0]
+    
+    # 3. 计算要保留的头的数量 k
+    k = int(round((1.0 - r) * num_heads)) # 四舍五入到最近的整数
+    k = max(1, k) # 至少保留1个头
+    
+    # 4. 找到 top-k 头的索引
+    _, top_k_indices = torch.topk(head_importance, k=k) # Shape: [k]
 
-    # 将分数展平以便排序
-    flat_scores = mask_scores.flatten()
-
-    # 计算需要保留的元素数量 k
-    k = int((1.0 - r) * flat_scores.numel())
-    # 确保k至少为1，避免全部剪掉
-    k = max(1, k) 
-
-    # 找到作为阈值的第k大的分数
-    top_k_threshold = torch.kthvalue(flat_scores, k).values
-
-    # 创建一个布尔掩码，标记重要单元 (大于等于阈值)
-    is_important = mask_scores >= top_k_threshold
-
-    # 应用tanh平滑函数，这是可微分的关键
-    # 对于不重要的单元，其值将被抑制趋近于0
-    # 对于重要的单元，其值将保持不变
-    tanh_term = torch.tanh(n * (mask_scores - theta)) # theta 在这里被使用但未返回
-
-    # 只保留重要单元的分数，不重要的置零
-    pruned_mask = torch.where(
-        is_important,
-        mask_scores, # 保留原始分数
-        torch.zeros_like(mask_scores) # 不重要的直接置零
-    )
-
+    # 5. 创建一个 "硬" 的结构化门控 (gate)
+    # 形状: [num_heads]
+    structural_gate = torch.zeros_like(head_importance)
+    structural_gate[top_k_indices] = 1.0
+    
+    # 6. 将门控广播回掩码形状
+    # [num_heads] -> [1, num_heads, 1]
+    final_gate = structural_gate.view(1, -1, 1)
+    
+    # 7. 应用门控
+    # (M * G) 是可微分的 (相对于 M)
+    # (M * G_hard) 的梯度会通过 M 传递
+    # 这就是 STE (Straight-Through Estimator)
+    pruned_mask = mask_scores * final_gate
+    
     return pruned_mask
 
 class LayerScale(nn.Module):
