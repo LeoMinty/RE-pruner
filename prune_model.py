@@ -1,7 +1,7 @@
 # prune_model.py
 import torch
 from torch import nn
-import timm
+from functools import partial
 import os
 from collections import OrderedDict
 # 导入 *原始* 的 ViT 和 Block, Attention
