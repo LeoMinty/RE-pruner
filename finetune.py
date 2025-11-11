@@ -136,7 +136,7 @@ class PrunedVisionTransformer(VisionTransformer):
         ])
         self.apply(self._init_weights)
     
-    def forward_features(self, x):
+    def forward_features(self, x, attn_mask=None):
         """重写 forward_features 以正确处理 ModuleList blocks"""
         x = self.patch_embed(x)
         x = self._pos_embed(x)

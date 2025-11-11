@@ -186,6 +186,19 @@ class PrunedVisionTransformer(VisionTransformer):
         ])
         
         self.apply(self._init_weights)
+    
+    def forward_features(self, x, attn_mask=None):
+        """重写 forward_features 以正确处理 ModuleList blocks"""
+        x = self.patch_embed(x)
+        x = self._pos_embed(x)
+        x = self.patch_drop(x)
+        x = self.norm_pre(x)
+        
+        for blk in self.blocks:
+            x = blk(x)
+        
+        x = self.norm(x)
+        return x
 
 # --- 实例化新模型 ---
 pruned_model = PrunedVisionTransformer(
