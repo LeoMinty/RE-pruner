@@ -185,7 +185,7 @@ for epoch in range(EPOCHS):
 
 print("第二阶段训练完成!")
 # 保存最终的剪枝模型
-output_filename = f"re_pruner_phase2_pruned_formal_theta_{NUM_CLASSES}class_r{ALPHA_TARGET}.pth"
+output_filename = f"re_pruner_phase2_pruned_formal_r_logit_{NUM_CLASSES}class_r{ALPHA_TARGET}.pth"
 print(f"正在将模型状态保存到: {output_filename} ...")
 torch.save(model.state_dict(), output_filename)
 print("保存成功！")
