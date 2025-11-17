@@ -12,7 +12,7 @@ from vision_transformer_modified import MaskedAttention
 
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100  # ImageNet100
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 LEARNING_RATE = 0.01
 EPOCHS = 50 # 论文中DeiT的训练轮数
 LAMBDA_SP = 0.01 # 稀疏性损失权重 (需要调试)
@@ -62,19 +62,52 @@ delta_f_scores = torch.load(SCFP_SCORES_FILE, map_location='cpu')
 epsilon = 1e-8 # 防止除以零
 print(f"成功加载 {len(delta_f_scores)} 个头的SCFP得分。")
 
-# --- 4. 加载模型并载入预训练权重 ---
-# 这是将预训练权重加载到修改后模型的标准方法
+# --- 4. 加载模型并载入预训练权重 (修复版) ---
 print("正在加载模型...")
-# a. 创建一个标准的、未经修改的预训练模型 (1000类)
-base_model = timm.create_model('deit_small_patch16_224', pretrained=True, num_classes=NUM_CLASSES)
-
-# b. 创建我们修改过的模型实例 (100类)
+# 1. 创建模型实例 (pretrained=False, 因为我们要手动加载)
 model = deit_small_patch16_224(pretrained=False, num_classes=NUM_CLASSES)
 
-# c. 加载权重 (忽略我们新增的mask和1000类->100类的分类头)
-model.load_state_dict(base_model.state_dict(), strict=False)
+# 2. 下载标准 DeiT-Small 预训练权重
+# 我们创建一个临时的标准模型来获取权重，或者直接下载权重文件
+print("下载/加载标准预训练权重...")
+base_model = timm.create_model('deit_small_patch16_224', pretrained=True)
+base_state_dict = base_model.state_dict()
+
+# 3. 调整权重键名以匹配 RE-Pruner 结构
+print("调整权重键名以匹配 MaskedAttention...")
+new_state_dict = {}
+for k, v in base_state_dict.items():
+    # 如果是注意力层的权重，需要增加一个 .attn 中间层
+    if '.attn.' in k:
+        new_k = k.replace('.attn.', '.attn.attn.')
+    else:
+        new_k = k
+        
+    # 处理分类头 (1000类 -> 100类)
+    # 如果是 head.weight/bias，且形状不匹配，则跳过(保持随机初始化)或进行处理
+    if 'head' in k:
+        if v.shape != model.state_dict()[k].shape:
+            print(f"跳过分类头权重: {k} (形状不匹配)")
+            continue
+            
+    new_state_dict[new_k] = v
+
+# 4. 加载调整后的权重到模型中
+missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+
+# 5. 验证加载是否成功
+print("\n--- 权重加载报告 ---")
+print(f"未找到的键 (Missing keys): {len(missing_keys)}")
+# 这里的 missing_keys 应该只包含 'explainability_mask', 'r_logit', 'theta' 等新参数
+# 以及分类头(如果跳过了)
+relevant_missing = [k for k in missing_keys if 'explainability_mask' not in k and 'r_logit' not in k and 'theta' not in k and 'head' not in k]
+if len(relevant_missing) > 0:
+    print(f"警告！以下关键权重未加载 (可能导致性能低下): \n{relevant_missing[:5]} ...")
+else:
+    print("成功：所有基础 Transformer 权重 (MHA, MLP) 均已正确加载！")
+
 model.to(device)
-print("模型加载完毕。")
+print("模型准备就绪。")
 
 
 # --- 5. 设置损失函数和优化器 ---
