@@ -73,7 +73,16 @@ def main():
         
     missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
     print("权重加载完成。")
-
+    
+    # 尝试加载 Phase 1 的训练模型（如果存在）
+    weight_path = "re_pruner_phase1_masks_100class.pth"
+    if os.path.exists(weight_path):
+        print(f"加载 Phase 1 训练后的模型: {weight_path}")
+        state_dict = torch.load(weight_path, map_location=device)
+        model.load_state_dict(state_dict, strict=False)
+    else:
+        print(f"未找到 {weight_path}，跳过加载 Phase 1 模型。")
+    
     model.to(device)
 
     # --- 关键步骤：冻结主干，只训练分类头 (Linear Probing) ---

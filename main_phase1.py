@@ -15,7 +15,7 @@ NUM_CLASSES = 100  # ImageNet100
 BATCH_SIZE = 128
 LEARNING_RATE = 0.01
 EPOCHS = 50 # 论文中DeiT的训练轮数
-LAMBDA_SP = 0.01 # 稀疏性损失权重 (需要调试)
+LAMBDA_SP = 1e-6 # 稀疏性损失权重 (需要调试)
 LAMBDA_SM = 0.01 # 平滑性损失权重 (需要调试)
 
 # --- 2. 准备数据集 (ImageNet100) ---
