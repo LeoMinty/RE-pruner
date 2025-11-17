@@ -10,7 +10,7 @@ from vision_transformer_modified import MaskedAttention # 导入用于类型检�
 
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 EPOCHS = 50 # 论文中DeiT的剪枝训练轮数
 ALPHA_TARGET = 0.5 # 目标总剪枝率
 

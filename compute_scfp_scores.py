@@ -22,7 +22,7 @@ NUM_HEADS = 6
 HEAD_DIM = EMBED_DIM // NUM_HEADS
 
 # 训练参数
-BATCH_SIZE = 64 # 根据您的GPU显存调整
+BATCH_SIZE = 128
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 OUTPUT_FILE = f'scfp_head_scores_{MODEL_NAME}.pt'

@@ -13,7 +13,7 @@ from timm.layers import DropPath, Mlp, to_2tuple
 
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100 
-BATCH_SIZE = 64 # 减小一点批量大小以便在VRAM中容纳
+BATCH_SIZE = 128
 FINETUNE_EPOCHS = 50
 FINETUNE_LR = 1e-5
 
