@@ -185,18 +185,27 @@ def calculate_total_loss_re_pruner(
 # --- RE-Pruner: 结束 ---
 
 # 冻结模型原始权重
+# 冻结除 掩码 和 分类头 以外的所有参数
 for name, param in model.named_parameters():
-    if "explainability_mask" not in name:
-        param.requires_grad = False
+    if "explainability_mask" in name:
+        param.requires_grad = True  # 训练掩码
+    elif "head" in name:
+        param.requires_grad = True  # 必须训练分类头，因为它目前是随机的！
+    else:
+        param.requires_grad = False # 冻结主干权重
 
-# 确认只有掩码是可训练的
+# 确认只有掩码(以及分类头)是可训练的
 print("以下参数将被训练:")
 for name, param in model.named_parameters():
     if param.requires_grad:
         print(name)
 
-# 优化器只包含掩码参数
-optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE, momentum=0.9)
+# 优化器只包含掩码参数(以及分类头)
+optimizer = torch.optim.SGD(
+    filter(lambda p: p.requires_grad, model.parameters()), 
+    lr=LEARNING_RATE, 
+    momentum=0.9
+)
 ce_loss_fn = nn.CrossEntropyLoss()
 
 # --- 6. 训练循环 ---
