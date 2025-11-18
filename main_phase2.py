@@ -11,7 +11,7 @@ from vision_transformer_modified import MaskedAttention # 导入用于类型检�
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100
 BATCH_SIZE = 128
-EPOCHS = 50 # 论文中DeiT的剪枝训练轮数
+EPOCHS = 50        # 论文中DeiT的剪枝训练轮数
 ALPHA_TARGET = 0.5 # 目标总剪枝率
 
 # 模型状态文件路径
@@ -62,7 +62,8 @@ with torch.no_grad():
             module.r_logit.data = torch.tensor([-2.0], device=device)
             # theta 也会被优化，但它在剪枝决策中不起作用
             module.theta.data = torch.tensor([0.0], device=device) 
-print("剪枝参数初始化完毕。")
+            module.is_pruning_phase = True # 开启剪枝模式
+            print("剪枝参数初始化完毕。")
 
 # 关键：激活所有MaskedAttention模块的剪枝模式
 num_prunable_elements = 0
@@ -115,8 +116,8 @@ for name, param in model.named_parameters():
 model_weights.append(beta)
 model_weights.append(gamma)
         
-optimizer_weights = torch.optim.AdamW(model_weights, lr=5e-4)
-optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.02)
+optimizer_weights = torch.optim.AdamW(model_weights, lr=1e-5)
+optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.01)
 
 print(f"模型权重参数组大小: {len(model_weights)}")
 print(f"剪枝参数组大小: {len(pruning_params)}")
@@ -149,7 +150,7 @@ for epoch in range(EPOCHS):
         )
         
         # 引入一个超参数 lambda_prune 来放大剪枝损失的权重
-        lambda_prune = 10.0 # 可以从1.0, 10.0, 100.0开始尝试
+        lambda_prune = 1.0 # 可以从1.0, 10.0, 100.0开始尝试
         total_loss = loss_ce + lambda_prune * loss_r
         # total_loss = loss_ce + loss_r
         
