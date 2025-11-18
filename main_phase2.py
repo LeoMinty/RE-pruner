@@ -11,7 +11,7 @@ from vision_transformer_modified import MaskedAttention # 导入用于类型检�
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100
 BATCH_SIZE = 128
-EPOCHS = 50        # 论文中DeiT的剪枝训练轮数
+EPOCHS = 30        # 论文中DeiT的剪枝训练轮数
 ALPHA_TARGET = 0.5 # 目标总剪枝率
 
 # 模型状态文件路径
@@ -53,17 +53,23 @@ model.load_state_dict(torch.load(MODEL_STATE_PATH, map_location=device), strict=
 model.to(device)
 print("加载成功！")
 
-print("正在强制重新初始化剪枝参数 (r_logit)...")
-with torch.no_grad(): 
-    for module in model.modules():
+print("正在初始化剪枝阈值 (theta) 到分数分布中心...")
+# 关键修复：解决梯度消失问题
+with torch.no_grad():
+    for name, module in model.named_modules():
         if isinstance(module, MaskedAttention):
-            # 重新初始化 r_logit 为一个小的负数
-            # sigmoid(-2.0) ≈ 0.119, 这样初始 R ≈ 0.119
-            module.r_logit.data = torch.tensor([-2.0], device=device)
-            # theta 也会被优化，但它在剪枝决策中不起作用
-            module.theta.data = torch.tensor([0.0], device=device) 
-            module.is_pruning_phase = True # 开启剪枝模式
-            print("剪枝参数初始化完毕。")
+            # 激活剪枝模式
+            module.is_pruning_phase = True
+            
+            # 计算当前层所有头的分数
+            scores = module.get_head_importance()
+            
+            # 将 theta 初始化为分数的均值
+            # 这样初始状态下，约50%的头会被保留，Sigmoid 处于线性区，梯度最丰富
+            mean_score = scores.mean()
+            module.theta.data.fill_(mean_score.item())
+            
+            print(f"  Layer {name}: Init Theta = {mean_score.item():.4f}")
 
 # 关键：激活所有MaskedAttention模块的剪枝模式
 num_prunable_elements = 0
@@ -81,33 +87,46 @@ ce_loss_fn = nn.CrossEntropyLoss()
 beta = nn.Parameter(torch.tensor(1.0, device=device))    # <-- 修改：初始化为 1.0
 gamma = nn.Parameter(torch.tensor(0.01, device=device))  # <-- 修改：初始化为 0.01
 
-def calculate_pruning_loss(model, alpha_target, total_prunable_elements, beta, gamma):
-    current_R = torch.tensor(0.0, device=device)
-    total_elements_processed = 0
+def calculate_pruning_loss(model, alpha_target, beta, gamma):
+    total_heads = 0
+    kept_heads_soft = torch.tensor(0.0, device=device)
+    
+    # 遍历所有层，计算当前的“软”保留数量
     for module in model.modules():
         if isinstance(module, MaskedAttention):
-            r = torch.sigmoid(module.r_logit)
-            num_elements_in_module = module.explainability_mask.numel()
+            scores = module.get_head_importance()
+            # 必须使用与 forward 中完全相同的公式计算 mask
+            # 这样 Loss 对 theta 的梯度才能正确回传
+            soft_mask = torch.sigmoid((scores - module.theta) * module.temperature)
             
-            current_R += (r * num_elements_in_module).sum()
-            total_elements_processed += num_elements_in_module
+            kept_heads_soft += soft_mask.sum()
+            total_heads += scores.numel() # 总头数
 
-    if total_elements_processed == 0:
+    if total_heads == 0:
         return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
 
-    current_R_avg = current_R / total_elements_processed
+    # 计算当前的全局剪枝率 (Pruning Rate)
+    # Retention Rate = kept / total
+    # Pruning Rate = 1 - Retention Rate
+    current_retention_rate = kept_heads_soft / total_heads
+    current_pruning_rate = 1.0 - current_retention_rate
     
-    loss_r = beta * (alpha_target - current_R_avg)**2 + gamma * (alpha_target - current_R_avg)
-    return loss_r, current_R_avg
+    # 使用你原来的 beta/gamma 公式 (Augmented Lagrangian)
+    # 目标是让 (alpha_target - current_pruning_rate) -> 0
+    diff = abs(alpha_target - current_pruning_rate)
+    loss_r = beta * (diff ** 2) + gamma * diff
+    
+    return loss_r, current_pruning_rate
 
 # --- 关键：为不同参数组设置不同的优化器和学习率 ---
 # a. 冻结第一阶段学到的掩码分数
 pruning_params = []
 model_weights = []
+
 for name, param in model.named_parameters():
     if "explainability_mask" in name:
         param.requires_grad = False
-    elif "r_logit" in name or "theta" in name:
+    elif "theta" in name:
         pruning_params.append(param)
     else:
         model_weights.append(param)
@@ -146,43 +165,45 @@ for epoch in range(EPOCHS):
         # 计算损失
         loss_ce = ce_loss_fn(outputs, labels)
         loss_r, current_R_val = calculate_pruning_loss(
-            model, ALPHA_TARGET, num_prunable_elements, beta, gamma 
+            model, ALPHA_TARGET, beta, gamma 
         )
         
         # 引入一个超参数 lambda_prune 来放大剪枝损失的权重
-        lambda_prune = 1.0 # 可以从1.0, 10.0, 100.0开始尝试
+        lambda_prune = 100.0 # 可以从1.0, 10.0, 100.0开始尝试
         total_loss = loss_ce + lambda_prune * loss_r
         # total_loss = loss_ce + loss_r
         
         # 反向传播
         total_loss.backward()
-
-        with torch.no_grad():
-            if beta.grad is not None:
-                beta.grad.neg_()  # 翻转梯度，实现梯度上升
-            if gamma.grad is not None:
-                gamma.grad.neg_() # 翻转梯度，实现梯度上升
         
         # 更新参数
         optimizer_weights.step()
         optimizer_pruning.step()
 
         with torch.no_grad():
+            # PyTorch 默认 backward 是累加梯度，step 是减去梯度 (w - lr*g)
+            # 我们要实现 w + lr*g，所以需要手动 flip 梯度符号再 step，或者手动加
+            # 下面是手动梯度上升的简单实现:
+            lr_lagrange = 0.01
+            if beta.grad is not None:
+                beta.data.add_(lr_lagrange * beta.grad) # Ascent
+                beta.grad.zero_()
+            if gamma.grad is not None:
+                gamma.data.add_(lr_lagrange * gamma.grad) # Ascent
+                gamma.grad.zero_()
+
+        with torch.no_grad():
             beta.data.clamp_(min=0)
             gamma.data.clamp_(min=0)
         
-        if i % 100 == 0: 
-            avg_r_logit = torch.tensor(0.0, device=device)
-            num_blocks = 0
-            for m in model.modules():
-                if isinstance(m, MaskedAttention):
-                    avg_r_logit += m.r_logit.data.sum()
-                    num_blocks += 1
-            if num_blocks > 0:
-                avg_r_logit /= num_blocks
+
             
-            print(f"Epoch [{epoch+1}/{EPOCHS}], Step [{i+1}/{len(train_loader)}], Total Loss: {total_loss.item():.4f}, CE Loss: {loss_ce.item():.4f}, Pruning Loss: {loss_r.item():.4f}, Current R: {current_R_val.item():.4f}, Avg r_logit: {avg_r_logit.item():.4f}")
-            print(f"  -> beta: {beta.item():.6f}, gamma: {gamma.item():.6f}")
+            if i % 100 == 0:
+                
+                print(f"Epoch [{epoch+1}/{EPOCHS}], Step [{i+1}/{len(train_loader)}], Total: {total_loss.item():.4f}, "
+                    f"CE: {loss_ce.item():.4f}, PruningLoss(raw): {loss_r.item():.4f}, "
+                    f"Current R: {current_R_val.item():.4f}"
+                    f"  -> beta: {beta.item():.6f}, gamma: {gamma.item():.6f}")
 
 print("第二阶段训练完成!")
 # 保存最终的剪枝模型
