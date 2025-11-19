@@ -35,21 +35,41 @@ total_heads_before = 0
 total_heads_after = 0
 
 for i in range(NUM_BLOCKS):
-    r_logit = state_dict[f'blocks.{i}.attn.r_logit']
+    # --- 适配 Theta 逻辑 ---
+    # 1. 读取 Theta
+    theta = state_dict.get(f'blocks.{i}.attn.theta')
+    if theta is None:
+        # 兼容性处理：如果找不到 theta，可能还是旧模型，或者名字不对
+        print(f"Error: Block {i} 找不到 theta 参数。请检查 Phase 2 是否正确运行。")
+        exit()
+    theta = theta.item()
+    
+    # 2. 读取 Mask 并计算分数 (与 MaskedAttention.get_head_importance 逻辑一致)
     mask_scores = state_dict[f'blocks.{i}.attn.explainability_mask']
+    # 维度: [num_classes, num_heads, head_dim]
+    # 计算重要性: Mean over classes -> Abs -> Sum over head_dim
+    avg_mask = mask_scores.mean(dim=0)
+    head_importance = avg_mask.abs().sum(dim=-1) # [num_heads]
     
-    num_heads = mask_scores.shape[1]
-    r = torch.sigmoid(r_logit).item()
-    num_heads_to_keep = int(round((1.0 - r) * num_heads))
-    num_heads_to_keep = max(1, num_heads_to_keep) 
+    num_heads = head_importance.shape[0]
     
-    head_importance = mask_scores.mean(dim=0).sum(dim=1)
-    _, top_k_indices = torch.topk(head_importance, k=num_heads_to_keep)
-    top_k_indices = sorted(top_k_indices.tolist()) 
+    # 3. 决策：分数 > 阈值 则保留
+    # 获取保留索引
+    kept_indices = torch.nonzero(head_importance > theta).squeeze(1).tolist()
     
-    pruning_config[i] = top_k_indices 
+    # 4. 安全检查：至少保留 1 个头，防止层断裂
+    if len(kept_indices) == 0:
+        print(f"警告: Block {i} 所有头均低于阈值。强制保留分数最高的一个头。")
+        top1_idx = torch.argmax(head_importance).item()
+        kept_indices = [top1_idx]
+        
+    kept_indices = sorted(kept_indices)
+    pruning_config[i] = kept_indices
     
-    print(f"Block {i}: 目标剪枝率 r={r:.4f}。保留 {num_heads_to_keep}/{num_heads} 个头。保留索引: {top_k_indices}")
+    num_heads_to_keep = len(kept_indices)
+
+    
+    print(f"Block {i}: Theta={theta:.4f}。保留 {num_heads_to_keep}/{num_heads} 个头。保留索引: {kept_indices}")
     total_heads_before += num_heads
     total_heads_after += num_heads_to_keep
 
@@ -64,7 +84,7 @@ new_head_counts = [len(pruning_config[i]) for i in range(NUM_BLOCKS)]
 print(f"每层保留的头数: {new_head_counts}")
 
 # --- *** ---
-# !!! 关键修复点：定义我们自己的 PrunedAttention 和 PrunedBlock !!!
+# 定义我们自己的 PrunedAttention 和 PrunedBlock !!!
 # --- *** ---
 
 class PrunedAttention(TimmAttention):
@@ -227,6 +247,10 @@ for (old_name, old_param) in state_dict.items():
     else:
         new_name = old_name
 
+    # 忽略不再需要的参数
+    if "explainability_mask" in new_name or "theta" in new_name or "r_logit" in new_name:
+        continue
+
     # 2. 复制非注意力参数
     if "attn" not in new_name:
         if new_name in pruned_state_dict and pruned_state_dict[new_name].shape == old_param.shape:
@@ -234,10 +258,12 @@ for (old_name, old_param) in state_dict.items():
         continue 
     
     # 3. 复制 *注意力* 参数 (结构化切片)
+    block_idx_str = new_name.split('.')[1] # blocks.0.attn...
+    if not block_idx_str.isdigit(): continue
+    block_idx = int(block_idx_str)
+    indices_to_keep = pruning_config[block_idx]
+    
     if "attn.qkv.weight" in new_name:
-        block_idx = int(new_name.split('.')[1])
-        indices_to_keep = pruning_config[block_idx]
-        
         old_qkv = old_param.view(3, BASE_NUM_HEADS, HEAD_DIM, BASE_EMBED_DIM)
         new_qkv = old_qkv[:, indices_to_keep, :, :]
         new_qkv = new_qkv.reshape(-1, BASE_EMBED_DIM) 
@@ -245,12 +271,9 @@ for (old_name, old_param) in state_dict.items():
         if new_qkv.shape == pruned_state_dict[new_name].shape:
             new_state_dict[new_name] = new_qkv
         else:
-            print(f"形状不匹配! {new_name}: {new_qkv.shape} vs {pruned_state_dict[new_name].shape}")
+            print(f"Shape mismatch! {new_name}")
 
     elif "attn.qkv.bias" in new_name:
-        block_idx = int(new_name.split('.')[1])
-        indices_to_keep = pruning_config[block_idx]
-
         old_bias = old_param.view(3, BASE_NUM_HEADS, HEAD_DIM)
         new_bias = old_bias[:, indices_to_keep, :]
         new_bias = new_bias.reshape(-1) 
@@ -258,12 +281,9 @@ for (old_name, old_param) in state_dict.items():
         if new_bias.shape == pruned_state_dict[new_name].shape:
             new_state_dict[new_name] = new_bias
         else:
-            print(f"形状不匹配! {new_name}: {new_bias.shape} vs {pruned_state_dict[new_name].shape}")
+            print(f"Shape mismatch! {new_name}")
 
     elif "attn.proj.weight" in new_name:
-        block_idx = int(new_name.split('.')[1])
-        indices_to_keep = pruning_config[block_idx]
-        
         old_proj = old_param.view(BASE_EMBED_DIM, BASE_NUM_HEADS, HEAD_DIM)
         new_proj = old_proj[:, indices_to_keep, :] 
         new_proj = new_proj.reshape(BASE_EMBED_DIM, -1) 
@@ -271,14 +291,14 @@ for (old_name, old_param) in state_dict.items():
         if new_proj.shape == pruned_state_dict[new_name].shape:
             new_state_dict[new_name] = new_proj
         else:
-            print(f"形状不匹配! {new_name}: {new_proj.shape} vs {pruned_state_dict[new_name].shape}")
+            print(f"Shape mismatch! {new_name}")
 
     elif "attn.proj.bias" in new_name:
         new_state_dict[new_name] = old_param
             
 # --- 加载新的状态字典 ---
 try:
-    pruned_model.load_state_dict(new_state_dict, strict=True) # <-- 使用 strict=True 确保所有键都匹配
+    pruned_model.load_state_dict(new_state_dict, strict=True)
     print("\n--- 成功：state_dict 键名和形状完全匹配！---")
     
     torch.save(pruned_model.state_dict(), FINAL_MODEL_PATH)
@@ -288,4 +308,3 @@ try:
 except RuntimeError as e:
     print("\n--- 错误：加载 state_dict 失败 ---")
     print(e)
-    print("\n请检查上面的日志，确保所有形状都匹配。")
