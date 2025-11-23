@@ -28,53 +28,34 @@ if not os.path.exists(PHASE2_MODEL_PATH):
     raise FileNotFoundError(f"模型文件 {PHASE2_MODEL_PATH} 不存在。")
 state_dict = torch.load(PHASE2_MODEL_PATH, map_location=device)
 
-# --- 2. 计算每层要保留的头的索引 ---
+# --- 2. 计算保留索引 (Head 和 Neuron) ---
 print("--- 正在计算要保留的注意力头 (结构化) ---")
 pruning_config = {}
 total_heads_before = 0
 total_heads_after = 0
 
 for i in range(NUM_BLOCKS):
-    # --- 适配 Theta 逻辑 ---
-    # 1. 读取 Theta
-    theta = state_dict.get(f'blocks.{i}.attn.theta')
-    if theta is None:
-        # 兼容性处理：如果找不到 theta，可能还是旧模型，或者名字不对
-        print(f"Error: Block {i} 找不到 theta 参数。请检查 Phase 2 是否正确运行。")
-        exit()
-    theta = theta.item()
+    config = {}
     
-    # 2. 读取 Mask 并计算分数 (与 MaskedAttention.get_head_importance 逻辑一致)
-    mask_scores = state_dict[f'blocks.{i}.attn.explainability_mask']
-    # 维度: [num_classes, num_heads, head_dim]
-    # 计算重要性: Mean over classes -> Abs -> Sum over head_dim
-    avg_mask = mask_scores.mean(dim=0)
-    head_importance = avg_mask.abs().sum(dim=-1) # [num_heads]
+    # A. 处理 Attention
+    theta_attn = state_dict.get(f'blocks.{i}.attn.theta').item()
+    mask_attn = state_dict[f'blocks.{i}.attn.explainability_mask']
+    importance_attn = mask_attn.mean(dim=0).abs().sum(dim=-1)
+    kept_heads = torch.nonzero(importance_attn > theta_attn).squeeze(1).tolist()
+    if not kept_heads: kept_heads = [torch.argmax(importance_attn).item()]
+    config['heads'] = sorted(kept_heads)
     
-    num_heads = head_importance.shape[0]
+    # B. 处理 MLP
+    theta_mlp = state_dict.get(f'blocks.{i}.mlp.theta').item()
+    mask_mlp = state_dict[f'blocks.{i}.mlp.explainability_mask']
+    importance_mlp = mask_mlp.mean(dim=0).abs() # MLP 只有 [hidden_dim]
+    kept_neurons = torch.nonzero(importance_mlp > theta_mlp).squeeze(1).tolist()
+    if not kept_neurons: kept_neurons = [torch.argmax(importance_mlp).item()]
+    config['neurons'] = sorted(kept_neurons)
     
-    # 3. 决策：分数 > 阈值 则保留
-    # 获取保留索引
-    kept_indices = torch.nonzero(head_importance > theta).squeeze(1).tolist()
-    
-    # 4. 安全检查：至少保留 1 个头，防止层断裂
-    if len(kept_indices) == 0:
-        print(f"警告: Block {i} 所有头均低于阈值。强制保留分数最高的一个头。")
-        top1_idx = torch.argmax(head_importance).item()
-        kept_indices = [top1_idx]
-        
-    kept_indices = sorted(kept_indices)
-    pruning_config[i] = kept_indices
-    
-    num_heads_to_keep = len(kept_indices)
+    pruning_config[i] = config
+    print(f"Block {i}: Kept Heads={len(config['heads'])}, Kept Neurons={len(config['neurons'])}")
 
-    
-    print(f"Block {i}: Theta={theta:.4f}。保留 {num_heads_to_keep}/{num_heads} 个头。保留索引: {kept_indices}")
-    total_heads_before += num_heads
-    total_heads_after += num_heads_to_keep
-
-print(f"\n总计：剪枝前共 {total_heads_before} 个头, 剪枝后保留 {total_heads_after} 个头。")
-print(f"头部参数稀疏度: {(total_heads_before - total_heads_after) / total_heads_before:.2%}")
 
 # --- 3. 创建一个新的、物理上更小的模型并复制权重 ---
 print("\n--- 正在创建并填充 *物理上* 剪枝后的模型 ---")
@@ -127,36 +108,24 @@ class PrunedAttention(TimmAttention):
         return x
 
 class PrunedBlock(TimmBlock):
-    """
-    一个继承自 timm Block 的类，
-    但确保它使用我们自定义的 PrunedAttention。
-    """
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, proj_bias=True,
-                 proj_drop=0., attn_drop=0., drop_path=0., 
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
-        # 同样，只调用 nn.Module 的 __init__
+    def __init__(self, dim, num_heads, mlp_hidden_dim, # 修改：接收具体的 hidden_dim
+                 qkv_bias=False, proj_bias=True, proj_drop=0., attn_drop=0., 
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super(TimmBlock, self).__init__()
         self.norm1 = norm_layer(dim)
-        # 关键：使用我们自定义的 PrunedAttention
-        self.attn = PrunedAttention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, proj_bias=proj_bias,
-            attn_drop=attn_drop, proj_drop=proj_drop)
-        
+        self.attn = PrunedAttention(dim, num_heads, qkv_bias, proj_bias, attn_drop, proj_drop)
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        # 关键：使用 timm.Mlp 并正确传递参数
+        
+        # 修改：直接使用具体的 hidden_features
         self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
-            act_layer=act_layer,
-            bias=proj_bias,
-            drop=proj_drop,
+            in_features=dim, 
+            hidden_features=mlp_hidden_dim, 
+            act_layer=act_layer, bias=proj_bias, drop=proj_drop
         )
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 重写 forward 以匹配 PrunedAttention (它不接受 y_labels 或 attn_mask)
+    
+    def forward(self, x):
         x = x + self.drop_path1(self.attn(self.norm1(x)))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
@@ -192,7 +161,8 @@ class PrunedVisionTransformer(VisionTransformer):
         self.blocks = nn.ModuleList([
             PrunedBlock( 
                 dim=kwargs['embed_dim'], 
-                num_heads=head_counts_per_block[i], # <-- 传入每层的新头数量
+                num_heads=len(pruning_config[i]['heads']),# <-- 传入每层的新头数量
+                mlp_hidden_dim=len(pruning_config[i]['neurons']),
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
                 proj_bias=proj_bias,
@@ -294,6 +264,27 @@ for (old_name, old_param) in state_dict.items():
             print(f"Shape mismatch! {new_name}")
 
     elif "attn.proj.bias" in new_name:
+        new_state_dict[new_name] = old_param
+
+    # 处理 MLP 权重
+    elif "mlp.fc1.weight" in new_name:
+        # old shape: [hidden, embed]
+        # new shape: [kept_hidden, embed]
+        neurons = pruning_config[block_idx]['neurons']
+        new_state_dict[new_name] = old_param[neurons, :]
+        
+    elif "mlp.fc1.bias" in new_name:
+        neurons = pruning_config[block_idx]['neurons']
+        new_state_dict[new_name] = old_param[neurons]
+        
+    elif "mlp.fc2.weight" in new_name:
+        # old shape: [embed, hidden]
+        # new shape: [embed, kept_hidden]
+        neurons = pruning_config[block_idx]['neurons']
+        new_state_dict[new_name] = old_param[:, neurons]
+        
+    # mlp.fc2.bias 不需要切片 (形状是 [embed_dim])
+    elif "mlp.fc2.bias" in new_name:
         new_state_dict[new_name] = old_param
             
 # --- 加载新的状态字典 ---

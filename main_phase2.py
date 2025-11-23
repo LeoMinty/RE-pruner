@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 
 # 关键：从你修改过的本地文件导入模型
 from deit_modified import deit_small_patch16_224
-from vision_transformer_modified import MaskedAttention # 导入用于类型检查
+from vision_transformer_modified import MaskedAttention, MaskedMlp # 导入用于类型检查
 
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100
@@ -53,23 +53,21 @@ model.load_state_dict(torch.load(MODEL_STATE_PATH, map_location=device), strict=
 model.to(device)
 print("加载成功！")
 
-print("正在初始化剪枝阈值 (theta) 到分数分布中心...")
-# 关键修复：解决梯度消失问题
+# 1. 初始化 Theta (同时处理 Attention 和 MLP)
+print("正在初始化剪枝阈值 (theta)...")
 with torch.no_grad():
     for name, module in model.named_modules():
-        if isinstance(module, MaskedAttention):
-            # 激活剪枝模式
+        if isinstance(module, (MaskedAttention, MaskedMlp)): # 同时检查两者
             module.is_pruning_phase = True
             
-            # 计算当前层所有头的分数
-            scores = module.get_head_importance()
-            
-            # 将 theta 初始化为分数的均值
-            # 这样初始状态下，约50%的头会被保留，Sigmoid 处于线性区，梯度最丰富
+            if isinstance(module, MaskedAttention):
+                scores = module.get_head_importance()
+            else: # MaskedMlp
+                scores = module.get_neuron_importance()
+                
             mean_score = scores.mean()
             module.theta.data.fill_(mean_score.item())
-            
-            print(f"  Layer {name}: Init Theta = {mean_score.item():.4f}")
+            print(f"  {name}: Init Theta = {mean_score.item():.4f}")
 
 # 关键：激活所有MaskedAttention模块的剪枝模式
 num_prunable_elements = 0
@@ -88,31 +86,26 @@ beta = nn.Parameter(torch.tensor(1.0, device=device))    # <-- 修改：初始�
 gamma = nn.Parameter(torch.tensor(0.01, device=device))  # <-- 修改：初始化为 0.01
 
 def calculate_pruning_loss(model, alpha_target, beta, gamma):
-    total_heads = 0
-    kept_heads_soft = torch.tensor(0.0, device=device)
+    total_units = 0
+    kept_units_soft = torch.tensor(0.0, device=device)
     
-    # 遍历所有层，计算当前的“软”保留数量
     for module in model.modules():
-        if isinstance(module, MaskedAttention):
-            scores = module.get_head_importance()
-            # 必须使用与 forward 中完全相同的公式计算 mask
-            # 这样 Loss 对 theta 的梯度才能正确回传
+        if isinstance(module, (MaskedAttention, MaskedMlp)):
+            if isinstance(module, MaskedAttention):
+                scores = module.get_head_importance()
+            else:
+                scores = module.get_neuron_importance()
+            
             soft_mask = torch.sigmoid((scores - module.theta) * module.temperature)
             
-            kept_heads_soft += soft_mask.sum()
-            total_heads += scores.numel() # 总头数
+            kept_units_soft += soft_mask.sum()
+            total_units += scores.numel()
 
-    if total_heads == 0:
-        return torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+    if total_units == 0: return torch.tensor(0.0), 0.0
 
-    # 计算当前的全局剪枝率 (Pruning Rate)
-    # Retention Rate = kept / total
-    # Pruning Rate = 1 - Retention Rate
-    current_retention_rate = kept_heads_soft / total_heads
+    current_retention_rate = kept_units_soft / total_units
     current_pruning_rate = 1.0 - current_retention_rate
     
-    # 使用你原来的 beta/gamma 公式 (Augmented Lagrangian)
-    # 目标是让 (alpha_target - current_pruning_rate) -> 0
     diff = abs(alpha_target - current_pruning_rate)
     loss_r = beta * (diff ** 2) + gamma * diff
     

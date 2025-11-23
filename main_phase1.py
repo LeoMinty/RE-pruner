@@ -8,7 +8,7 @@ import os
 
 # 关键：从你修改过的本地文件导入模型
 from deit_modified import deit_small_patch16_224
-from vision_transformer_modified import MaskedAttention
+from vision_transformer_modified import MaskedAttention, MaskedMlp
 
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100  # ImageNet100
@@ -170,13 +170,41 @@ def calculate_total_loss_re_pruner(
                 else:
                     # 如果由于某种原因找不到分数，打印警告
                     print(f"警告: 找不到 {scfp_key} 的SCFP分数。将不应用稀疏惩罚。")
-                    
-    # [注意]：此实现仅惩罚了Attention Head。
-    # 如果您的 `vision_transformer_modified.py` 也为MLP层添加了掩码，
-    # 您需要在这里添加对它们的处理 (例如，使用原始的、未加权的稀疏惩罚)
-    for name, param in model.named_parameters():
-        if "mlp_mask" in name:
-            loss_adaptive_sparse += torch.norm(param, p=2) # 示例：添加原始的L2惩罚
+        # --- 2. MLP 处理 (新增 & 向量化优化) ---
+        if hasattr(block, 'mlp') and isinstance(block.mlp, MaskedMlp):
+            mask_tensor_mlp = block.mlp.explainability_mask # [num_classes, hidden_dim]
+            
+            # A. 平滑性损失
+            if mask_tensor_mlp.shape[0] > 1:
+                diff_mlp = mask_tensor_mlp[1:, :] - mask_tensor_mlp[:-1, :]
+                loss_smooth += torch.norm(diff_mlp, p=1)
+            
+            # B. 自适应稀疏性损失 (向量化加速)
+            hidden_dim = mask_tensor_mlp.shape[1]
+            
+            # 动态构建当前层所有神经元的 SCFP 分数向量
+            # 注意：scfp_scores 是字典，我们需要转为 Tensor
+            # 建议在函数外或 epoch 开始前预处理好这些 Tensor 以进一步提速，
+            # 但在这里构建也行，因为 Phase 1 训练瓶颈主要在反向传播
+            
+            # 尝试从缓存获取或构建
+            # 这里的 keys 列表推导式: ['blocks.0.mlp.neuron.0', 'blocks.0.mlp.neuron.1', ...]
+            mlp_keys = [f'blocks.{block_idx}.mlp.neuron.{n}' for n in range(hidden_dim)]
+            
+            # 从字典中提取分数，若不存在则给 0 (即最大惩罚 1/eps) 或 1 (标准惩罚)
+            # 这里给一个较大的默认值或均值可能更安全，或者 0.0
+            layer_scfp_vals = [scfp_scores.get(k, 0.0) for k in mlp_keys]
+            layer_scfp_tensor = torch.tensor(layer_scfp_vals, device=device)
+            
+            # 计算惩罚权重向量: [hidden_dim]
+            penalty_vec = 1.0 / (torch.abs(layer_scfp_tensor) + epsilon)
+            
+            # 计算 Mask 的列范数 (Column Norms): [hidden_dim]
+            # dim=0 是对 num_classes 求范数
+            mask_col_norms = torch.norm(mask_tensor_mlp, p=2, dim=0)
+            
+            # 加权求和: dot product
+            loss_adaptive_sparse += torch.sum(penalty_vec * mask_col_norms)            
 
     # 总损失
     total_loss = loss_ce + lambda_sp * loss_adaptive_sparse + lambda_sm * loss_smooth

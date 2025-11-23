@@ -154,6 +154,61 @@ class MaskedAttention(nn.Module):
         x_out = self.attn.proj_drop(x_proj)
         return x_out
 
+class MaskedMlp(nn.Module):
+    def __init__(self, original_mlp_module, num_classes):
+        super().__init__()
+        self.mlp = original_mlp_module
+        
+        # MLP 的结构通常是: fc1 (in->hidden) -> act -> fc2 (hidden->out)
+        # 我们要剪枝的是中间维度 (hidden_features)
+        hidden_dim = self.mlp.fc1.out_features
+        
+        # 创建 MLP 的掩码: [num_classes, hidden_dim]
+        # 相比 Attention，这里没有 "heads" 维度，只有神经元维度
+        self.explainability_mask = nn.Parameter(torch.ones(num_classes, hidden_dim))
+        
+        # 剪枝阈值 (Phase 2 使用)
+        self.theta = nn.Parameter(torch.zeros(1))
+        self.temperature = 10.0
+        self.is_pruning_phase = False
+
+    def get_neuron_importance(self):
+        """计算类无关的神经元重要性分数"""
+        # 对类别维度求平均: [hidden_dim]
+        avg_mask = self.explainability_mask.mean(dim=0)
+        return avg_mask.abs()
+
+    def forward(self, x, y_labels=None):
+        # x: [B, N, C]
+        B, N, C = x.shape
+        
+        # 1. FC1 + Activation (前半部分)
+        x = self.mlp.fc1(x)
+        x = self.mlp.act(x)
+        x = self.mlp.drop1(x)
+        
+        # 2. 计算掩码
+        if self.is_pruning_phase:
+            # [Phase 2] 软掩码
+            scores = self.get_neuron_importance() # [hidden_dim]
+            soft_mask = torch.sigmoid((scores - self.theta) * self.temperature)
+            final_mask = soft_mask.view(1, 1, -1) # 广播: [1, 1, hidden_dim]
+        else:
+            # [Phase 1] 训练掩码
+            if y_labels is not None:
+                mask_scores = self.explainability_mask[y_labels] # [B, hidden_dim]
+            else:
+                mask_scores = torch.mean(self.explainability_mask, dim=0).unsqueeze(0).expand(B, -1)
+            final_mask = mask_scores.unsqueeze(1) # [B, 1, hidden_dim]
+            
+        # 3. 应用掩码 (在 Activation 之后, FC2 之前)
+        x = x * final_mask
+        
+        # 4. FC2 (后半部分)
+        x = self.mlp.fc2(x)
+        x = self.mlp.drop2(x)
+        return x
+
 def differentiable_pruning_operation(mask_scores, r_logit, theta=None, n=10.0):
     """
     执行 *结构化* 剪枝 (按头剪枝)。
@@ -282,7 +337,7 @@ class Block(nn.Module):
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = mlp_layer(
+        original_mlp = mlp_layer(
             in_features=dim,
             hidden_features=int(dim * mlp_ratio),
             act_layer=act_layer,
@@ -290,12 +345,14 @@ class Block(nn.Module):
             bias=proj_bias,
             drop=proj_drop,
         )
+        self.mlp = MaskedMlp(original_mlp, num_classes=num_classes)
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x: torch.Tensor, y_labels: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), y_labels=y_labels)))
-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+    def forward(self, x, y_labels=None, attn_mask=None):
+        # 传递 y_labels 给 attn 和 mlp
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), y_labels=y_labels, attn_mask=attn_mask)))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x), y_labels=y_labels))) # 传入 y_labels
         return x
 
 
