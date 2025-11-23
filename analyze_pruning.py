@@ -12,8 +12,8 @@ from timm.models.vision_transformer import VisionTransformer, Block as TimmBlock
 from timm.layers import DropPath, Mlp, to_2tuple
 
 # --- 配置 ---
-PRUNED_MODEL_PATH = "re_pruner_PHYSICALLY_pruned.pth"
-PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_r_logit_100class_r0.5.pth" 
+PRUNED_MODEL_PATH = "re_pruner_finetuned_best_100class.pth"
+PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.5.pth" 
 
 NUM_CLASSES = 100
 NUM_BLOCKS = 12
