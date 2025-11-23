@@ -18,7 +18,7 @@ FINETUNE_EPOCHS = 50
 FINETUNE_LR = 1e-5
 
 PRUNED_MODEL_PATH = "re_pruner_PHYSICALLY_pruned.pth"
-PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_r_logit_100class_r0.5.pth" 
+PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.5.pth" 
 
 IMAGENET_SUBSET_TRAIN_PATH = "/root/autodl-tmp/imagenet100"
 IMAGENET_SUBSET_VAL_PATH = "/root/autodl-tmp/imagenet100_val" # 验证集路径
@@ -46,24 +46,43 @@ val_dataset = datasets.ImageFolder(IMAGENET_SUBSET_VAL_PATH, transform=transform
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 print(f"训练集: {len(train_dataset)} 图像, 验证集: {len(val_dataset)} 图像。")
 
-# --- 3. 重建 *物理* 剪枝的模型结构 ---
+# --- 3. 重建 *物理* 剪枝的模型结构 (适配 Theta) ---
 print("--- 正在重建物理剪枝模型结构 ---")
-# a. 首先，我们需要知道每层到底留了几个头
 if not os.path.exists(PHASE2_MODEL_PATH):
     raise FileNotFoundError(f"模型文件 {PHASE2_MODEL_PATH} 不存在。")
 state_dict_phase2 = torch.load(PHASE2_MODEL_PATH, map_location=device)
+
 new_head_counts = []
-for i in range(12): # 12 blocks for DeiT-Small
-    r_logit = state_dict_phase2[f'blocks.{i}.attn.r_logit']
-    r = torch.sigmoid(r_logit).item()
-    num_heads_to_keep = int(round((1.0 - r) * 6)) # 6 heads for DeiT-Small
-    num_heads_to_keep = max(1, num_heads_to_keep)
+BASE_NUM_HEADS = 6
+
+for i in range(12): # 12 blocks
+    # 1. 读取 Theta
+    theta = state_dict_phase2.get(f'blocks.{i}.attn.theta')
+    if theta is None:
+        print(f"Error: Block {i} 缺失 theta")
+        exit()
+    theta = theta.item()
+    
+    # 2. 读取 Mask 并计算分数
+    mask_scores = state_dict_phase2[f'blocks.{i}.attn.explainability_mask']
+    avg_mask = mask_scores.mean(dim=0)
+    head_importance = avg_mask.abs().sum(dim=-1) # [num_heads]
+    
+    # 3. 计数
+    kept_indices = torch.nonzero(head_importance > theta).squeeze(1)
+    num_heads_to_keep = kept_indices.numel()
+    
+    # 4. 至少保留 1 个
+    if num_heads_to_keep == 0:
+        num_heads_to_keep = 1
+        
     new_head_counts.append(num_heads_to_keep)
+
 print(f"学习到的保留头数量: {new_head_counts}")
 
 # b. 定义我们的 Pruned 类 (与 prune_model.py  一致)
 BASE_EMBED_DIM = 384
-HEAD_DIM = BASE_EMBED_DIM // 6
+HEAD_DIM = BASE_EMBED_DIM // BASE_NUM_HEADS
 
 class PrunedAttention(TimmAttention):
     def __init__(self, dim, num_heads, qkv_bias=False, proj_bias=True, attn_drop=0., proj_drop=0.):

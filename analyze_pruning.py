@@ -22,27 +22,38 @@ BASE_EMBED_DIM = 384
 HEAD_DIM = BASE_EMBED_DIM // BASE_NUM_HEADS
 device = torch.device("cpu")
 
-# --- 1. 重建 *物理* 剪枝的模型结构 ---
+# --- 1. 重建 *物理* 剪枝模型结构 (适配 Theta) ---
 print("--- 正在重建物理剪枝模型结构 ---")
-# a. 首先，我们需要知道每层到底留了几个头
 if not os.path.exists(PHASE2_MODEL_PATH):
     raise FileNotFoundError(f"模型文件 {PHASE2_MODEL_PATH} 不存在。")
 state_dict_phase2 = torch.load(PHASE2_MODEL_PATH, map_location=device)
-pruning_config = {}
 new_head_counts = []
-layer_pruning_rates = []
+layer_pruning_rates = [] # 存储每层的剪枝率 (1 - r)
 
 for i in range(NUM_BLOCKS):
-    r_logit = state_dict_phase2.get(f'blocks.{i}.attn.r_logit')
-    if r_logit is None:
-        print(f"警告: 在 {PHASE2_MODEL_PATH} 中未找到 block {i} 的 r_logit。")
+    # 1. 读取 Theta
+    theta = state_dict_phase2.get(f'blocks.{i}.attn.theta')
+    if theta is None:
+        print(f"Block {i} 缺失 theta")
         continue
-        
-    r = torch.sigmoid(r_logit).item()
-    layer_pruning_rates.append(r)
-    num_heads_to_keep = int(round((1.0 - r) * BASE_NUM_HEADS))
-    num_heads_to_keep = max(1, num_heads_to_keep)
-    new_head_counts.append(num_heads_to_keep)
+    theta = theta.item()
+    
+    # 2. 读取 Mask
+    mask_scores = state_dict_phase2[f'blocks.{i}.attn.explainability_mask']
+    avg_mask = mask_scores.mean(dim=0)
+    head_importance = avg_mask.abs().sum(dim=-1)
+    
+    # 3. 计算保留数量
+    num_heads_kept = (head_importance > theta).sum().item()
+    num_heads_kept = max(1, num_heads_kept)
+    
+    new_head_counts.append(num_heads_kept)
+    
+    # 4. 计算这一层的剪枝率 (Pruned ratio)
+    # 注意：这里记录的是"剪掉了多少"，即 1 - (kept / total)
+    pruning_rate = 1.0 - (num_heads_kept / BASE_NUM_HEADS)
+    layer_pruning_rates.append(pruning_rate)
+
 print(f"学习到的保留头数量: {new_head_counts}")
 
 # b. 定义 Pruned 类 (与 finetune.py  一致)
