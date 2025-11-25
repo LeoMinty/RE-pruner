@@ -11,7 +11,7 @@ from vision_transformer_modified import MaskedAttention, MaskedMlp # 导入用�
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100
 BATCH_SIZE = 128
-EPOCHS = 30        # 论文中DeiT的剪枝训练轮数
+EPOCHS = 3        # 论文中DeiT的剪枝训练轮数
 ALPHA_TARGET = 0.5 # 目标总剪枝率
 
 # 模型状态文件路径
@@ -86,30 +86,65 @@ beta = nn.Parameter(torch.tensor(1.0, device=device))    # <-- 修改：初始�
 gamma = nn.Parameter(torch.tensor(0.01, device=device))  # <-- 修改：初始化为 0.01
 
 def calculate_pruning_loss(model, alpha_target, beta, gamma):
-    total_units = 0
-    kept_units_soft = torch.tensor(0.0, device=device)
+    total_params_proxy = 0.0
+    kept_params_proxy = torch.tensor(0.0, device=device)
+    
+    # 参数量权重
+    WEIGHT_HEAD = 128.0
+    WEIGHT_NEURON = 1.0
+    
+    # Theta 边界惩罚损失
+    loss_theta_boundary = torch.tensor(0.0, device=device)
+    MIN_RETENTION_RATIO = 0.15  # 强制每层 MLP 至少保留 15%
     
     for module in model.modules():
-        if isinstance(module, (MaskedAttention, MaskedMlp)):
-            if isinstance(module, MaskedAttention):
-                scores = module.get_head_importance()
-            else:
-                scores = module.get_neuron_importance()
-            
+        # --- A. Attention Heads ---
+        if isinstance(module, MaskedAttention):
+            scores = module.get_head_importance()
             soft_mask = torch.sigmoid((scores - module.theta) * module.temperature)
             
-            kept_units_soft += soft_mask.sum()
-            total_units += scores.numel()
+            kept_params_proxy += soft_mask.sum() * WEIGHT_HEAD
+            total_params_proxy += scores.numel() * WEIGHT_HEAD
 
-    if total_units == 0: return torch.tensor(0.0), 0.0
+        # --- B. MLP Neurons ---
+        elif isinstance(module, MaskedMlp):
+            scores = module.get_neuron_importance()
+            
+            # 1. 计算常规的软掩码
+            soft_mask = torch.sigmoid((scores - module.theta) * module.temperature)
+            kept_params_proxy += soft_mask.sum() * WEIGHT_NEURON
+            total_params_proxy += scores.numel() * WEIGHT_NEURON
+            
+            # 2. 计算 Theta 的安全边界
+            sorted_scores, _ = torch.sort(scores, descending=True)
+            num_neurons = scores.numel()
+            
+            safe_idx = int(num_neurons * MIN_RETENTION_RATIO)
+            safe_idx = min(safe_idx, num_neurons - 1)
+            safe_threshold = sorted_scores[safe_idx]
+            
+            # 如果 theta > safe_threshold，说明保留的太少了，需要惩罚
+            if module.theta > safe_threshold:
+                # [修复点]：(module.theta - safe_threshold) ** 2 形状是 [1]
+                # 使用 .sum() 将其变为标量 []，以便与 loss_theta_boundary 相加
+                penalty = (module.theta - safe_threshold) ** 2
+                loss_theta_boundary = loss_theta_boundary + penalty.sum()
 
-    current_retention_rate = kept_units_soft / total_units
+    if total_params_proxy == 0: 
+        return torch.tensor(0.0, device=device), 0.0
+
+    # 全局保留率
+    current_retention_rate = kept_params_proxy / total_params_proxy
     current_pruning_rate = 1.0 - current_retention_rate
     
+    # 剪枝目标 Loss
     diff = abs(alpha_target - current_pruning_rate)
     loss_r = beta * (diff ** 2) + gamma * diff
     
-    return loss_r, current_pruning_rate
+    # 总 Loss = 全局目标 + 局部防塌陷约束
+    total_pruning_loss = loss_r + 10000.0 * loss_theta_boundary
+    
+    return total_pruning_loss, current_pruning_rate
 
 # --- 关键：为不同参数组设置不同的优化器和学习率 ---
 # a. 冻结第一阶段学到的掩码分数
@@ -129,7 +164,7 @@ model_weights.append(beta)
 model_weights.append(gamma)
         
 optimizer_weights = torch.optim.AdamW(model_weights, lr=1e-5)
-optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.01)
+optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.005)
 
 print(f"模型权重参数组大小: {len(model_weights)}")
 print(f"剪枝参数组大小: {len(pruning_params)}")
