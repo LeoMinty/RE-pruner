@@ -33,6 +33,8 @@ print("--- 正在计算要保留的注意力头 (结构化) ---")
 pruning_config = {}
 total_heads_before = 0
 total_heads_after = 0
+total_neurons_before = 0
+total_neurons_after = 0
 
 for i in range(NUM_BLOCKS):
     config = {}
@@ -52,16 +54,39 @@ for i in range(NUM_BLOCKS):
     kept_neurons = torch.nonzero(importance_mlp > theta_mlp).squeeze(1).tolist()
     if not kept_neurons: kept_neurons = [torch.argmax(importance_mlp).item()]
     config['neurons'] = sorted(kept_neurons)
-    
+
+    # 获取 MLP 统计信息
+    n_neurons_total = mask_mlp.shape[1]
+    n_neurons_kept = len(config['neurons'])
+    # 获取 Attention 统计信息
+    n_heads_total = mask_attn.shape[1]
+    n_heads_kept = len(config['heads'])
+
     pruning_config[i] = config
-    print(f"Block {i}: Kept Heads={len(config['heads'])}, Kept Neurons={len(config['neurons'])}")
+    # 更新总计数
+    total_heads_before += n_heads_total
+    total_heads_after += n_heads_kept
+    total_neurons_before += n_neurons_total
+    total_neurons_after += n_neurons_kept
+    # 打印当前层的详细信息
+    print(f"Block {i}: "
+          f"Heads={n_heads_kept}/{n_heads_total} (Pruned: {1 - n_heads_kept/n_heads_total:.2%}), "
+          f"Neurons={n_neurons_kept}/{n_neurons_total} (Pruned: {1 - n_neurons_kept/n_neurons_total:.2%})")
+
+# 打印全局统计信息
+print("-" * 60)
+print(f"Total Heads:   {total_heads_after}/{total_heads_before} "
+      f"(Global Pruned: {1 - total_heads_after/total_heads_before:.2%})")
+print(f"Total Neurons: {total_neurons_after}/{total_neurons_before} "
+      f"(Global Pruned: {1 - total_neurons_after/total_neurons_before:.2%})")
+print("-" * 60)
 
 
 # --- 3. 创建一个新的、物理上更小的模型并复制权重 ---
 print("\n--- 正在创建并填充 *物理上* 剪枝后的模型 ---")
 
 # 计算每层最终保留的头数量（按顺序），用于构建物理上剪枝后的模型
-new_head_counts = [len(pruning_config[i]) for i in range(NUM_BLOCKS)]
+new_head_counts = [len(pruning_config[i]['heads']) for i in range(NUM_BLOCKS)]
 print(f"每层保留的头数: {new_head_counts}")
 
 # --- *** ---
