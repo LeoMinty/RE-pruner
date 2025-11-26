@@ -11,7 +11,7 @@ from vision_transformer_modified import MaskedAttention, MaskedMlp # 导入用�
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100
 BATCH_SIZE = 128
-EPOCHS = 3        # 论文中DeiT的剪枝训练轮数
+EPOCHS = 30        # 剪枝训练轮数
 ALPHA_TARGET = 0.5 # 目标总剪枝率
 
 # 模型状态文件路径
