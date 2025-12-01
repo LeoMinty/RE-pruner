@@ -13,7 +13,7 @@ from timm.layers import DropPath, Mlp, to_2tuple
 
 # --- 配置 ---
 PRUNED_MODEL_PATH = "re_pruner_PHYSICALLY_pruned.pth"
-PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.5.pth" 
+PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.4.pth" 
 
 NUM_CLASSES = 100
 NUM_BLOCKS = 12
@@ -183,7 +183,7 @@ original_model.eval()
 if layer_pruning_rates:
     avg_r = sum(layer_pruning_rates) / len(layer_pruning_rates)
     print(f"\n--- 平均加权参数剪枝率: {avg_r:.4f} ---")
-    
+    outfile_name= f'layer_pruning_rates_r{int(avg_r*100)}.png'
     plt.figure(figsize=(10, 6))
     plt.bar(range(len(layer_pruning_rates)), layer_pruning_rates, color='skyblue')
     plt.xlabel('Transformer Block Index')
@@ -192,8 +192,8 @@ if layer_pruning_rates:
     plt.xticks(range(len(layer_pruning_rates)))
     plt.ylim(0, 1.1)
     plt.grid(axis='y', linestyle='--')
-    plt.savefig('layer_pruning_rates.png')
-    print("剪枝率可视化图已保存为 layer_pruning_rates.png")
+    plt.savefig(outfile_name)
+    print("剪枝率可视化图已保存为 ", outfile_name)
 
 # --- 4. 计算并对比 FLOPs 和 Params ---
 print("\n--- 正在计算 FLOPs 和 参数 ---")
