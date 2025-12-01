@@ -18,7 +18,7 @@ FINETUNE_EPOCHS = 20
 FINETUNE_LR = 1e-5
 
 PRUNED_MODEL_PATH = "re_pruner_PHYSICALLY_pruned.pth"
-PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.5.pth" 
+PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.4.pth" 
 
 IMAGENET_SUBSET_TRAIN_PATH = "/root/autodl-tmp/imagenet100"
 IMAGENET_SUBSET_VAL_PATH = "/root/autodl-tmp/imagenet100_val" # 验证集路径
