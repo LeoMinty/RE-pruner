@@ -12,7 +12,7 @@ from vision_transformer_modified import MaskedAttention, MaskedMlp # 导入用�
 NUM_CLASSES = 100
 BATCH_SIZE = 128
 EPOCHS = 30        # 剪枝训练轮数
-ALPHA_TARGET = 0.5 # 目标总剪枝率
+ALPHA_TARGET = 0.4 # 目标总剪枝率
 
 # 模型状态文件路径
 MODEL_STATE_PATH = "re_pruner_phase1_masks_100class.pth"
@@ -95,7 +95,7 @@ def calculate_pruning_loss(model, alpha_target, beta, gamma):
     
     # Theta 边界惩罚损失
     loss_theta_boundary = torch.tensor(0.0, device=device)
-    MIN_RETENTION_RATIO = 0.15  # 强制每层 MLP 至少保留 15%
+    MIN_RETENTION_RATIO = 0.25  # 强制每层 MLP 至少保留 25%
     
     for module in model.modules():
         # --- A. Attention Heads ---
@@ -197,7 +197,7 @@ for epoch in range(EPOCHS):
         )
         
         # 引入一个超参数 lambda_prune 来放大剪枝损失的权重
-        lambda_prune = 100.0 # 可以从1.0, 10.0, 100.0开始尝试
+        lambda_prune = 80.0 # 可以从1.0, 10.0, 100.0开始尝试
         total_loss = loss_ce + lambda_prune * loss_r
         # total_loss = loss_ce + loss_r
         
