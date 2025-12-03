@@ -1,2 +1,2 @@
 __pycache__/*.pyc
-data_cifar/cifar-10-python.tar.gz
+data_cifar/*
