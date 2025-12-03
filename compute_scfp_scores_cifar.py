@@ -6,30 +6,34 @@ from torch.utils.data import DataLoader, Dataset
 import numpy as np
 from tqdm import tqdm
 import os
-import argparse
+from utils_cifar import get_cifar10_datasets # <--- 引入工具
 
-# 导入 CIFAR 工具
-from utils_cifar import get_cifar10_datasets
-
-# --- 配置 ---
-NUM_CLASSES = 10
+# --- 1. 配置 ---
+NUM_CLASSES = 10 # <--- 修改为 10
+# 模型参数 (deit_small)
 MODEL_NAME = 'deit_small_patch16_224'
 NUM_BLOCKS = 12
 EMBED_DIM = 384
 NUM_HEADS = 6
 HEAD_DIM = EMBED_DIM // NUM_HEADS
 
-BATCH_SIZE = 64 # CIFAR resize后显存占用较大，适当减小 BatchSize
+# 训练参数
+BATCH_SIZE = 128
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OUTPUT_FILE = f'scfp_head_scores_cifar10_{MODEL_NAME}.pt'
+OUTPUT_FILE = f'scfp_head_scores_cifar10_{MODEL_NAME}.pt' # <--- 修改文件名
 
-# --- 伪 (Knockoff) 数据集 ---
-class KnockoffDatasetCifar(Dataset):
+# --- 2. 准备数据集 ---
+# 使用 utils_cifar 获取数据集
+real_dataset, _ = get_cifar10_datasets()
+real_loader = DataLoader(real_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+
+# C. 伪 (Knockoff) 数据集
+class KnockoffDatasetCIFAR(Dataset):
     """适配 CIFAR-10 的 Knockoff Dataset"""
     def __init__(self, original_dataset):
         self.original_dataset = original_dataset
-        # CIFAR10 dataset 使用 .targets 存储标签
+        # CIFAR-10 使用 .targets
         self.knockoff_labels = np.random.permutation(original_dataset.targets)
         
     def __len__(self):
@@ -38,16 +42,24 @@ class KnockoffDatasetCifar(Dataset):
     def __getitem__(self, idx):
         image, _ = self.original_dataset[idx]
         knockoff_label = self.knockoff_labels[idx]
-        return image, torch.tensor(knockoff_label).long()
+        return image, torch.tensor(knockoff_label)
 
-# --- 计算费舍尔信息 (逻辑保持不变) ---
+print("创建伪 (Knockoff) 数据集...")
+knockoff_dataset = KnockoffDatasetCIFAR(real_dataset)
+knockoff_loader = DataLoader(knockoff_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+
+# --- 3. 计算费舍尔信息 (F) ---
+# (此函数保持原样，未做修改)
 def get_fisher_scores(model, data_loader, device):
+    """计算模型中每个注意力头的经验费舍尔信息 (E[grad^2])"""
+    
     fisher_scores = {}
-    # 初始化
     for i in range(NUM_BLOCKS):
         for h in range(NUM_HEADS):
-            fisher_scores[f'blocks.{i}.attn.head.{h}'] = 0.0
+            key = f'blocks.{i}.attn.head.{h}'
+            fisher_scores[key] = 0.0
         # MLP Neurons
+        # 此时模型已在 device 上，直接获取
         hidden_dim = model.blocks[i].mlp.fc1.out_features
         for n in range(hidden_dim):
             fisher_scores[f'blocks.{i}.mlp.neuron.{n}'] = 0.0
@@ -55,69 +67,80 @@ def get_fisher_scores(model, data_loader, device):
     criterion = nn.CrossEntropyLoss().to(device)
     model.train() 
 
-    # 限制 Batch 数量以加快计算 (可选，全量计算更准)
-    MAX_BATCHES = 200 
     num_batches = 0
-    
-    pbar = tqdm(data_loader, desc="Calculating Fisher Info")
+    pbar = tqdm(data_loader, desc="计算费舍尔信息")
     for images, labels in pbar:
-        if num_batches >= MAX_BATCHES: break
-        
         images, labels = images.to(device), labels.to(device)
+        
         model.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, labels)
+        
         loss.backward()
 
         for block_idx, block in enumerate(model.blocks):
-            # Attention Heads
             qkv_grad_sq = block.attn.qkv.weight.grad.pow(2)
             proj_grad_sq = block.attn.proj.weight.grad.pow(2)
-            qkv_view = qkv_grad_sq.view(3, NUM_HEADS, HEAD_DIM, EMBED_DIM)
-            proj_view = proj_grad_sq.view(EMBED_DIM, NUM_HEADS, HEAD_DIM)
 
-            for h in range(NUM_HEADS):
-                score = qkv_view[:, h, :, :].sum() + proj_view[:, h, :].sum()
-                fisher_scores[f'blocks.{block_idx}.attn.head.{h}'] += score.item()
+            qkv_grad_sq_view = qkv_grad_sq.view(3, NUM_HEADS, HEAD_DIM, EMBED_DIM)
+            proj_grad_sq_view = proj_grad_sq.view(EMBED_DIM, NUM_HEADS, HEAD_DIM)
 
-            # MLP Neurons
-            fc1_grad_sq = block.mlp.fc1.weight.grad.pow(2).sum(dim=1)
-            fc2_grad_sq = block.mlp.fc2.weight.grad.pow(2).sum(dim=0)
-            neuron_scores = fc1_grad_sq + fc2_grad_sq
+            for head_idx in range(NUM_HEADS):
+                key = f'blocks.{block_idx}.attn.head.{head_idx}'
+                qkv_head_score = qkv_grad_sq_view[:, head_idx, :, :].sum()
+                proj_head_score = proj_grad_sq_view[:, head_idx, :].sum()
+                total_head_score = qkv_head_score + proj_head_score
+                fisher_scores[key] += total_head_score.item()
             
-            for n in range(len(neuron_scores)):
-                fisher_scores[f'blocks.{block_idx}.mlp.neuron.{n}'] += neuron_scores[n].item()
+            # MLP
+            fc1_grad_sq = block.mlp.fc1.weight.grad.pow(2) 
+            fc2_grad_sq = block.mlp.fc2.weight.grad.pow(2) 
+            fc1_neuron_scores = fc1_grad_sq.sum(dim=1)
+            fc2_neuron_scores = fc2_grad_sq.sum(dim=0)
+            total_neuron_scores = fc1_neuron_scores + fc2_neuron_scores
+
+            hidden_dim_curr = total_neuron_scores.shape[0]
+            for n in range(hidden_dim_curr):
+                key = f'blocks.{block_idx}.mlp.neuron.{n}'
+                fisher_scores[key] += total_neuron_scores[n].item()
 
         num_batches += 1
-
+        
     for key in fisher_scores:
         fisher_scores[key] /= num_batches
+        
     return fisher_scores
 
+# --- 4. 主执行逻辑 ---
 if __name__ == "__main__":
-    print(f"Loading Model: {MODEL_NAME}")
-    # 注意：这里加载 ImageNet 预训练权重。
-    # 理想情况下，计算 Fisher Score 最好使用在 CIFAR-10 上 Finetune 过的模型。
-    # 但为了流程简单，我们暂时使用预训练权重，只需重置分类头。
+    print(f"正在加载预训练模型: {MODEL_NAME}")
     model = timm.create_model(MODEL_NAME, pretrained=True)
-    model.head = nn.Linear(model.head.in_features, NUM_CLASSES) # 重置为10类
+    # <--- 关键：重置 Head 以匹配 CIFAR-10 的 10 类，防止 shape mismatch 报错
+    model.head = nn.Linear(model.head.in_features, NUM_CLASSES)
     model.to(DEVICE)
     
-    # 获取数据集
-    real_dataset, _ = get_cifar10_datasets()
-    knockoff_dataset = KnockoffDatasetCifar(real_dataset)
-    
-    real_loader = DataLoader(real_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    knockoff_loader = DataLoader(knockoff_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    # 2. 计算 F_real
+    print("开始计算 F_real (真实数据)...")
+    fisher_real_scores = get_fisher_scores(model, real_loader, DEVICE)
+    print("F_real 计算完毕。")
 
-    print("Calculating F_real...")
-    fisher_real = get_fisher_scores(model, real_loader, DEVICE)
-    
-    print("Calculating F_knockoff...")
-    fisher_knockoff = get_fisher_scores(model, knockoff_loader, DEVICE)
+    # 3. 计算 F_knockoff
+    print("开始计算 F_knockoff (伪数据)...")
+    fisher_knockoff_scores = get_fisher_scores(model, knockoff_loader, DEVICE)
+    print("F_knockoff 计算完毕。")
 
-    print("Calculating Delta F...")
-    delta_f = {k: fisher_real[k] - fisher_knockoff.get(k, 0.0) for k in fisher_real}
+    # 4. 计算 Delta F (可靠性得分)
+    print("正在计算 Delta F (可靠性得分)...")
+    delta_f_scores = {
+        key: fisher_real_scores[key] - fisher_knockoff_scores.get(key, 0.0)
+        for key in fisher_real_scores
+    }
 
-    torch.save(delta_f, OUTPUT_FILE)
-    print(f"Scores saved to {OUTPUT_FILE}")
+    print("\n--- 示例可靠性得分 (Delta F) ---")
+    for i in range(min(5, len(delta_f_scores))):
+        key = list(delta_f_scores.keys())[i]
+        print(f"{key}: {delta_f_scores[key]}")
+
+    print(f"\n正在将得分保存到: {OUTPUT_FILE}")
+    torch.save(delta_f_scores, OUTPUT_FILE)
+    print("SCFP可靠性得分已成功保存。")
