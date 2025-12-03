@@ -13,12 +13,12 @@ from timm.layers import DropPath, Mlp, to_2tuple
 
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100 
-BATCH_SIZE = 64 # 减小一点批量大小以便在VRAM中容纳
-FINETUNE_EPOCHS = 50
+BATCH_SIZE = 128
+FINETUNE_EPOCHS = 20
 FINETUNE_LR = 1e-5
 
 PRUNED_MODEL_PATH = "re_pruner_PHYSICALLY_pruned.pth"
-PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_r_logit_100class_r0.5.pth" 
+PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.4.pth" 
 
 IMAGENET_SUBSET_TRAIN_PATH = "/root/autodl-tmp/imagenet100"
 IMAGENET_SUBSET_VAL_PATH = "/root/autodl-tmp/imagenet100_val" # 验证集路径
@@ -46,24 +46,49 @@ val_dataset = datasets.ImageFolder(IMAGENET_SUBSET_VAL_PATH, transform=transform
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 print(f"训练集: {len(train_dataset)} 图像, 验证集: {len(val_dataset)} 图像。")
 
-# --- 3. 重建 *物理* 剪枝的模型结构 ---
+# --- 3. 重建 *物理* 剪枝的模型结构 (适配 Theta) ---
 print("--- 正在重建物理剪枝模型结构 ---")
-# a. 首先，我们需要知道每层到底留了几个头
 if not os.path.exists(PHASE2_MODEL_PATH):
     raise FileNotFoundError(f"模型文件 {PHASE2_MODEL_PATH} 不存在。")
 state_dict_phase2 = torch.load(PHASE2_MODEL_PATH, map_location=device)
+
 new_head_counts = []
+new_neuron_counts = []
+BASE_NUM_HEADS = 6
+BASE_EMBED_DIM = 384
+HEAD_DIM = 64
+
 for i in range(12): # 12 blocks for DeiT-Small
-    r_logit = state_dict_phase2[f'blocks.{i}.attn.r_logit']
-    r = torch.sigmoid(r_logit).item()
-    num_heads_to_keep = int(round((1.0 - r) * 6)) # 6 heads for DeiT-Small
-    num_heads_to_keep = max(1, num_heads_to_keep)
-    new_head_counts.append(num_heads_to_keep)
+    # --- A. 计算 Heads ---
+    theta_attn = state_dict_phase2.get(f'blocks.{i}.attn.theta')
+    mask_attn = state_dict_phase2[f'blocks.{i}.attn.explainability_mask']
+    if theta_attn is None: 
+        print(f"Error: Block {i} missing theta")
+        exit()
+        
+    importance_attn = mask_attn.mean(dim=0).abs().sum(dim=-1)
+    kept_heads = torch.nonzero(importance_attn > theta_attn.item()).squeeze(1)
+    n_heads = kept_heads.numel()
+    if n_heads == 0: n_heads = 1
+    new_head_counts.append(n_heads)
+    
+    # --- B. 计算 Neurons [关键修复] ---
+    theta_mlp = state_dict_phase2.get(f'blocks.{i}.mlp.theta')
+    mask_mlp = state_dict_phase2[f'blocks.{i}.mlp.explainability_mask']
+    
+    importance_mlp = mask_mlp.mean(dim=0).abs()
+    kept_neurons = torch.nonzero(importance_mlp > theta_mlp.item()).squeeze(1)
+    n_neurons = kept_neurons.numel()
+    if n_neurons == 0: n_neurons = 1
+    new_neuron_counts.append(n_neurons)
+
 print(f"学习到的保留头数量: {new_head_counts}")
+print(f"学习到的保留神经元数量: {new_neuron_counts}")
+
 
 # b. 定义我们的 Pruned 类 (与 prune_model.py  一致)
 BASE_EMBED_DIM = 384
-HEAD_DIM = BASE_EMBED_DIM // 6
+HEAD_DIM = BASE_EMBED_DIM // BASE_NUM_HEADS
 
 class PrunedAttention(TimmAttention):
     def __init__(self, dim, num_heads, qkv_bias=False, proj_bias=True, attn_drop=0., proj_drop=0.):
@@ -88,9 +113,10 @@ class PrunedAttention(TimmAttention):
         return x
 
 class PrunedBlock(TimmBlock):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, proj_bias=True,
+    # 必须接收 mlp_hidden_dim
+    def __init__(self, dim, num_heads, mlp_hidden_dim, qkv_bias=False, proj_bias=True,
                  proj_drop=0., attn_drop=0., drop_path=0., 
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, mlp_ratio=None):
         super(TimmBlock, self).__init__()
         self.norm1 = norm_layer(dim)
         self.attn = PrunedAttention(
@@ -98,18 +124,21 @@ class PrunedBlock(TimmBlock):
             attn_drop=attn_drop, proj_drop=proj_drop)
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
+        
+        # 使用 mlp_hidden_dim
         self.mlp = Mlp(
-            in_features=dim, hidden_features=mlp_hidden_dim,
+            in_features=dim, 
+            hidden_features=mlp_hidden_dim, 
             act_layer=act_layer, bias=proj_bias, drop=proj_drop)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.drop_path1(self.attn(self.norm1(x)))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
 
 class PrunedVisionTransformer(VisionTransformer):
-    def __init__(self, head_counts_per_block, **kwargs):
+    def __init__(self, head_counts_per_block, neuron_counts_per_block, **kwargs):
         depth = len(head_counts_per_block)
         drop_path_rate = kwargs.get('drop_path_rate', 0.)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -123,15 +152,18 @@ class PrunedVisionTransformer(VisionTransformer):
 
         super_kwargs = kwargs.copy()
         super_kwargs['depth'] = depth
-        super_kwargs['num_heads'] = 6 # 占位符
+        super_kwargs['num_heads'] = 6
         super().__init__(**super_kwargs)
         del self.blocks
         self.blocks = nn.ModuleList([
             PrunedBlock( 
-                dim=kwargs['embed_dim'], num_heads=head_counts_per_block[i], 
-                mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, proj_bias=proj_bias,
+                dim=kwargs['embed_dim'], 
+                num_heads=head_counts_per_block[i], 
+                mlp_hidden_dim=neuron_counts_per_block[i], # <--- 传入神经元数
+                qkv_bias=qkv_bias, proj_bias=proj_bias,
                 proj_drop=proj_drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i],
-                norm_layer=norm_layer, act_layer=act_layer
+                norm_layer=norm_layer, act_layer=act_layer,
+                mlp_ratio=None
             ) for i in range(depth)
         ])
         self.apply(self._init_weights)
@@ -152,6 +184,7 @@ class PrunedVisionTransformer(VisionTransformer):
 # c. 实例化物理上更小的模型
 pruned_model = PrunedVisionTransformer(
     head_counts_per_block=new_head_counts,
+    neuron_counts_per_block=new_neuron_counts, # <--- 传入
     patch_size=16, embed_dim=BASE_EMBED_DIM, depth=12,
     num_classes=NUM_CLASSES, qkv_bias=True, proj_bias=True, 
     norm_layer=partial(nn.LayerNorm, eps=1e-6),

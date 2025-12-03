@@ -84,75 +84,130 @@ class MaskedAttention(nn.Module):
         super().__init__()
         self.attn = original_attention_module
         
-        # 为每个注意力头创建一个与类别相关的掩码
-        # 维度: (类别数, 头数, 每个头的输出维度)
-        # 注意：论文中掩码维度是 C x d，这里我们为每个头创建，更精细
         head_dim = self.attn.head_dim
         num_heads = self.attn.num_heads
         
+        # 保持与 Phase 1 一致的掩码定义
         self.explainability_mask = nn.Parameter(torch.ones(num_classes, num_heads, head_dim))
 
-        # --- 新增：为剪枝阶段创建可学习参数 ---
-        self.r_logit = nn.Parameter(torch.zeros(1)) # sigmoid(r_logit) -> 剪枝率 r
-        self.theta = nn.Parameter(torch.zeros(1))   # 剪枝阈值 theta
-        self.is_pruning_phase = False # 一个开关，用于区分不同阶段
-
-    def forward(self, x, y_labels=None, attn_mask = None):
-        # x: input tensor
-        # y_labels: ground truth labels for the current batch, shape (batch_size,)
+        # --- 修改点：使用 theta (阈值) 而非 r_logit ---
+        # 初始化为 0，将在 main_phase2.py 中被智能初始化覆盖
+        self.theta = nn.Parameter(torch.zeros(1)) 
         
+        # 温度系数，控制 Soft Mask 的陡峭程度
+        # 值越大，越接近 0/1 硬截断；值越小，梯度越平滑。推荐 5.0 - 10.0
+        self.temperature = 10.0 
+        
+        self.is_pruning_phase = False 
+
+    def get_head_importance(self):
+        """计算类无关的头重要性分数"""
+        # 对类别维度(dim=0)取平均，对特征维度(dim=2)求L1范数
+        # Shape: [num_heads]
+        avg_mask = self.explainability_mask.mean(dim=0)
+        head_importance = avg_mask.abs().sum(dim=-1)
+        return head_importance
+
+    def forward(self, x, y_labels=None, attn_mask=None):
         B, N, C = x.shape
         
-        # 1. 原始的注意力计算
-        # (B, num_heads, N, N)
+        # 1. 原始 Attention 计算 (保持不变)
         attn_weights = self.attn.qkv(x).reshape(B, N, 3, self.attn.num_heads, self.attn.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = attn_weights[0], attn_weights[1], attn_weights[2]
         
         attn = (q @ k.transpose(-2, -1)) * self.attn.scale
-
         if attn_mask is not None:
             attn = attn + attn_mask
         attn = attn.softmax(dim=-1)
         attn = self.attn.attn_drop(attn)
+        x_attn = (attn @ v) # [B, num_heads, N, head_dim]
         
-        # (B, num_heads, N, head_dim)
-        x_attn = (attn @ v)
-        
-        # --- 根据阶段选择不同的掩码 ---
-        if y_labels is not None:
-            # --- 阶段 1: 掩码学习 (传入了 y_labels) ---
-            # 使用与类别相关的掩码分数
-            mask_scores = self.explainability_mask[y_labels] # Shape [B, num_heads, head_dim]
-        else:
-            # --- 阶段 2 或 3: (y_labels is None) ---
-            # 使用 "类无关" 的掩码分数 (在所有类别上取平均)
-            # 这代表了每个单元的 "通用重要性"
-            # Shape: [num_heads, head_dim]
-            avg_mask_scores = torch.mean(self.explainability_mask, dim=0) 
-            
-            # 扩展维度以匹配 x_attn 的批次大小
-            # Shape: [B, num_heads, head_dim]
-            mask_scores = avg_mask_scores.unsqueeze(0).expand(B, -1, -1)
-
-        # --- 剪枝阶段应用 ---
+        # --- 修改点：Phase 2 使用基于 Theta 的软掩码 ---
         if self.is_pruning_phase:
-            # 阶段 2: 应用可微分剪枝 (仍然使用 "类无关" 的 mask_scores)
-            final_mask = differentiable_pruning_operation(mask_scores, self.r_logit, self.theta)
+            # 获取重要性分数 [num_heads]
+            scores = self.get_head_importance()
+            
+            # 生成软掩码 (Soft Mask / Gate)
+            # Sigmoid((Score - Theta) * Temp)
+            # 当 Score > Theta 时，mask -> 1 (保留)
+            # 当 Score < Theta 时，mask -> 0 (剪枝)
+            # 这里的梯度是连续的！
+            soft_mask = torch.sigmoid((scores - self.theta) * self.temperature)
+            
+            # 广播 mask 以匹配 x_attn: [1, num_heads, 1, 1]
+            final_mask = soft_mask.view(1, -1, 1, 1)
+            
         else:
-            # 阶段 1 或 3: 直接使用掩码
-            final_mask = mask_scores      
-        
-        # 调整mask形状以进行广播: (B, num_heads, 1, head_dim)
-        final_mask = final_mask.unsqueeze(2)
-        
-        # 应用掩码 (element-wise multiplication)
+            # Phase 1: 保持原逻辑，使用类相关掩码进行训练
+            if y_labels is not None:
+                mask_scores = self.explainability_mask[y_labels] # [B, H, D]
+            else:
+                mask_scores = torch.mean(self.explainability_mask, dim=0).unsqueeze(0).expand(B, -1, -1)
+            final_mask = mask_scores.unsqueeze(2) # [B, H, 1, D]
+
+        # 应用掩码
         x_masked = x_attn * final_mask
         
-        # 3. 后续原始操作
+        # 后续投影
         x_reshaped = x_masked.transpose(1, 2).reshape(B, N, self.attn.head_dim * self.attn.num_heads)
         x_proj = self.attn.proj(x_reshaped)
         x_out = self.attn.proj_drop(x_proj)
         return x_out
+
+class MaskedMlp(nn.Module):
+    def __init__(self, original_mlp_module, num_classes):
+        super().__init__()
+        self.mlp = original_mlp_module
+        
+        # MLP 的结构通常是: fc1 (in->hidden) -> act -> fc2 (hidden->out)
+        # 我们要剪枝的是中间维度 (hidden_features)
+        hidden_dim = self.mlp.fc1.out_features
+        
+        # 创建 MLP 的掩码: [num_classes, hidden_dim]
+        # 相比 Attention，这里没有 "heads" 维度，只有神经元维度
+        self.explainability_mask = nn.Parameter(torch.ones(num_classes, hidden_dim))
+        
+        # 剪枝阈值 (Phase 2 使用)
+        self.theta = nn.Parameter(torch.zeros(1))
+        self.temperature = 10.0
+        self.is_pruning_phase = False
+
+    def get_neuron_importance(self):
+        """计算类无关的神经元重要性分数"""
+        # 对类别维度求平均: [hidden_dim]
+        avg_mask = self.explainability_mask.mean(dim=0)
+        return avg_mask.abs()
+
+    def forward(self, x, y_labels=None):
+        # x: [B, N, C]
+        B, N, C = x.shape
+        
+        # 1. FC1 + Activation (前半部分)
+        x = self.mlp.fc1(x)
+        x = self.mlp.act(x)
+        x = self.mlp.drop1(x)
+        
+        # 2. 计算掩码
+        if self.is_pruning_phase:
+            # [Phase 2] 软掩码
+            scores = self.get_neuron_importance() # [hidden_dim]
+            soft_mask = torch.sigmoid((scores - self.theta) * self.temperature)
+            final_mask = soft_mask.view(1, 1, -1) # 广播: [1, 1, hidden_dim]
+        else:
+            # [Phase 1] 训练掩码
+            if y_labels is not None:
+                mask_scores = self.explainability_mask[y_labels] # [B, hidden_dim]
+            else:
+                mask_scores = torch.mean(self.explainability_mask, dim=0).unsqueeze(0).expand(B, -1)
+            final_mask = mask_scores.unsqueeze(1) # [B, 1, hidden_dim]
+            
+        # 3. 应用掩码 (在 Activation 之后, FC2 之前)
+        x = x * final_mask
+        
+        # 4. FC2 (后半部分)
+        x = self.mlp.fc2(x)
+        x = self.mlp.drop2(x)
+        return x
 
 def differentiable_pruning_operation(mask_scores, r_logit, theta=None, n=10.0):
     """
@@ -282,7 +337,7 @@ class Block(nn.Module):
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = mlp_layer(
+        original_mlp = mlp_layer(
             in_features=dim,
             hidden_features=int(dim * mlp_ratio),
             act_layer=act_layer,
@@ -290,12 +345,14 @@ class Block(nn.Module):
             bias=proj_bias,
             drop=proj_drop,
         )
+        self.mlp = MaskedMlp(original_mlp, num_classes=num_classes)
         self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
-    def forward(self, x: torch.Tensor, y_labels: Optional[torch.Tensor] = None, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), y_labels=y_labels)))
-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+    def forward(self, x, y_labels=None, attn_mask=None):
+        # 传递 y_labels 给 attn 和 mlp
+        x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x), y_labels=y_labels, attn_mask=attn_mask)))
+        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x), y_labels=y_labels))) # 传入 y_labels
         return x
 
 

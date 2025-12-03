@@ -8,11 +8,11 @@ import os
 
 # 关键：从你修改过的本地文件导入模型
 from deit_modified import deit_small_patch16_224
-from vision_transformer_modified import MaskedAttention
+from vision_transformer_modified import MaskedAttention, MaskedMlp
 
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100  # ImageNet100
-BATCH_SIZE = 64
+BATCH_SIZE = 128
 LEARNING_RATE = 0.01
 EPOCHS = 50 # 论文中DeiT的训练轮数
 LAMBDA_SP = 0.01 # 稀疏性损失权重 (需要调试)
@@ -54,96 +54,170 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- 3. 加载SCFP可靠性得分 ---
 print("加载SCFP可靠性得分...")
-SCFP_SCORES_FILE = f'scfp_head_scores_deit_small_patch16_224_100class.pt'
+SCFP_SCORES_FILE = f'scfp_head_scores_deit_small_patch16_224.pt'
 if not os.path.exists(SCFP_SCORES_FILE):
-    raise FileNotFoundError(f"SCFP得分文件 {SCFP_SCORES_FILE} 不存在。请先运行 compute_scfp_scores.py。")
+    raise FileNotFoundError(f"SCFP得分文件 {SCFP_SCORES_FILE} 不存在。")
 
 delta_f_scores = torch.load(SCFP_SCORES_FILE, map_location='cpu')
-epsilon = 1e-8 # 防止除以零
-print(f"成功加载 {len(delta_f_scores)} 个头的SCFP得分。")
+epsilon = 1e-8 
+print(f"成功加载 SCFP 得分字典。")
 
-# --- 4. 加载模型并载入预训练权重 ---
-# 这是将预训练权重加载到修改后模型的标准方法
+# [新增]：预计算全局分数均值 (用于归一化)
+print("正在计算 SCFP 全局均值以进行归一化...")
+# 提取所有 Head 的分数 (key 包含 'attn.head')
+all_head_scores = [v for k, v in delta_f_scores.items() if 'attn.head' in k]
+# 提取所有 Neuron 的分数 (key 包含 'mlp.neuron')
+all_neuron_scores = [v for k, v in delta_f_scores.items() if 'mlp.neuron' in k]
+
+# 计算绝对值的均值 (反映分数的平均强度)
+# 如果列表为空(防御性编程)，设为 1.0 避免除零
+if len(all_head_scores) > 0:
+    HEAD_SCORE_MEAN = torch.tensor(all_head_scores).abs().mean().item()
+else:
+    print("警告: 未找到 Head 分数，使用默认均值 1.0")
+    HEAD_SCORE_MEAN = 1.0
+
+if len(all_neuron_scores) > 0:
+    NEURON_SCORE_MEAN = torch.tensor(all_neuron_scores).abs().mean().item()
+else:
+    print("警告: 未找到 Neuron 分数，使用默认均值 1.0")
+    NEURON_SCORE_MEAN = 1.0
+
+print(f"全局 Head 分数均值 (Abs): {HEAD_SCORE_MEAN:.6f}")
+print(f"全局 Neuron 分数均值 (Abs): {NEURON_SCORE_MEAN:.6f}")
+
+# --- 4. 加载模型并载入预训练权重 (修复版) ---
 print("正在加载模型...")
-# a. 创建一个标准的、未经修改的预训练模型 (1000类)
-base_model = timm.create_model('deit_small_patch16_224', pretrained=True, num_classes=NUM_CLASSES)
-
-# b. 创建我们修改过的模型实例 (100类)
+# 1. 创建模型实例 (pretrained=False, 因为我们要手动加载)
 model = deit_small_patch16_224(pretrained=False, num_classes=NUM_CLASSES)
 
-# c. 加载权重 (忽略我们新增的mask和1000类->100类的分类头)
-model.load_state_dict(base_model.state_dict(), strict=False)
+# 2. 下载标准 DeiT-Small 预训练权重
+# 我们创建一个临时的标准模型来获取权重，或者直接下载权重文件
+print("下载/加载标准预训练权重...")
+base_model = timm.create_model('deit_small_patch16_224', pretrained=True)
+base_state_dict = base_model.state_dict()
+
+print("调整权重键名以匹配 MaskedAttention 和 MaskedMlp...")
+new_state_dict = {}
+for k, v in base_state_dict.items():
+    # 1. 处理 Attention: .attn. -> .attn.attn.
+    if '.attn.' in k:
+        new_k = k.replace('.attn.', '.attn.attn.')
+        
+    # 2. [新增] 处理 MLP: .mlp. -> .mlp.mlp.
+    # 因为 MaskedMlp(original_mlp) 结构使得内部多了一层 .mlp
+    elif '.mlp.' in k:
+        new_k = k.replace('.mlp.', '.mlp.mlp.')
+        
+    else:
+        new_k = k
+        
+    # 处理分类头 (1000类 -> 100类)
+    if 'head' in k:
+        if v.shape != model.state_dict()[k].shape:
+            print(f"跳过分类头权重: {k} (形状不匹配)")
+            continue
+            
+    new_state_dict[new_k] = v
+
+# 4. 加载调整后的权重到模型中
+missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+
+# 5. 验证加载是否成功
+print("\n--- 权重加载报告 ---")
+print(f"未找到的键 (Missing keys): {len(missing_keys)}")
+# 这里的 missing_keys 应该只包含 'explainability_mask', 'r_logit', 'theta' 等新参数
+# 以及分类头(如果跳过了)
+relevant_missing = [k for k in missing_keys if 'explainability_mask' not in k and 'r_logit' not in k and 'theta' not in k and 'head' not in k]
+if len(relevant_missing) > 0:
+    print(f"警告！以下关键权重未加载 (可能导致性能低下): \n{relevant_missing[:5]} ...")
+else:
+    print("成功：所有基础 Transformer 权重 (MHA, MLP) 均已正确加载！")
+
 model.to(device)
-print("模型加载完毕。")
+print("模型准备就绪。")
 
 
 # --- 5. 设置损失函数和优化器 ---
 def calculate_total_loss_re_pruner(
-    model, 
-    outputs, 
-    labels, 
-    ce_loss_fn, 
-    lambda_sp, 
-    lambda_sm, 
-    scfp_scores, 
-    device, 
-    epsilon
+    model, outputs, labels, ce_loss_fn, lambda_sp, lambda_sm, 
+    scfp_scores, device, epsilon,
+    head_score_mean, neuron_score_mean # [接收预计算的均值]
 ):
-    """
-    计算第一阶段的总损失，使用基于SCFP的自适应稀疏正则化 (RE-Pruner)。
-    """
-    
-    # 1. 交叉熵损失
     loss_ce = ce_loss_fn(outputs, labels)
-    
     loss_adaptive_sparse = torch.tensor(0.0, device=device)
     loss_smooth = torch.tensor(0.0, device=device)
+    
+    # 计数器：记录参与稀疏惩罚的单元总数 (Heads + Neurons)
+    total_prunable_elements = 0
 
-    # 遍历模型中的所有Block
     for block_idx, block in enumerate(model.blocks):
-        # 确保我们正在处理正确的模块
+        
+        # --- A. 处理 Attention ---
         if isinstance(block.attn, MaskedAttention):
-            # 获取该Block中所有头的掩码张量
-            # 形状为: [num_classes, num_heads, head_dim]
             mask_tensor = block.attn.explainability_mask 
-            
-            # 3. 平滑性损失 (L_smooth - Eq. 6) - 论文中的简化实现
-            if mask_tensor.shape[0] > 1: # 确保类别数大于1
-                diff = mask_tensor[1:, ...] - mask_tensor[:-1, ...]
-                loss_smooth += torch.norm(diff, p=1) # L1 norm of differences
+            # 平滑损失 (保持 sum，因为数量级较小)
+            if mask_tensor.shape[0] > 1:
+                loss_smooth += torch.norm(mask_tensor[1:] - mask_tensor[:-1], p=1)
 
-            # 2. 自适应稀疏性损失 (L_adaptive_sparse - 融合方案)
-            num_heads_in_block = mask_tensor.shape[1]
-            for head_idx in range(num_heads_in_block):
-                # 构建SCFP得分文件中的key
-                scfp_key = f'blocks.{block_idx}.attn.head.{head_idx}'
-                
-                if scfp_key in scfp_scores:
-                    delta_F_i = scfp_scores[scfp_key]
-                    
-                    # 可靠性越低，惩罚权重越高。
-                    delta_F_i_tensor = torch.tensor(delta_F_i, device=device)
-                    
-                    # 惩罚权重 (基于费舍尔信息正则化)
-                    penalty_weight = 1.0 / (torch.abs(delta_F_i_tensor) + epsilon)
-                    
-                    # 提取这个特定头的掩码 (跨所有类别)
-                    # 形状: [num_classes, head_dim]
-                    head_mask = mask_tensor[:, head_idx, :]
-                    
-                    # 计算L2范数并施加惩罚
-                    loss_adaptive_sparse += penalty_weight * torch.norm(head_mask, p=2)
-                
-                else:
-                    # 如果由于某种原因找不到分数，打印警告
-                    print(f"警告: 找不到 {scfp_key} 的SCFP分数。将不应用稀疏惩罚。")
-                    
-    # [注意]：此实现仅惩罚了Attention Head。
-    # 如果您的 `vision_transformer_modified.py` 也为MLP层添加了掩码，
-    # 您需要在这里添加对它们的处理 (例如，使用原始的、未加权的稀疏惩罚)
-    for name, param in model.named_parameters():
-        if "mlp_mask" in name:
-            loss_adaptive_sparse += torch.norm(param, p=2) # 示例：添加原始的L2惩罚
+            # 获取 Head 分数
+            num_heads = mask_tensor.shape[1]
+            head_keys = [f'blocks.{block_idx}.attn.head.{h}' for h in range(num_heads)]
+            # 获取分数，若缺失则默认为均值 (即标准惩罚)
+            raw_scores = [scfp_scores.get(k, head_score_mean) for k in head_keys]
+            raw_scores_tensor = torch.tensor(raw_scores, device=device)
+            
+            # [归一化 1] 分数归一化：让分数围绕 1.0 波动
+            # normalized_score = score / mean
+            norm_scores = raw_scores_tensor / (head_score_mean + epsilon)
+            
+            # [归一化 2] 惩罚权重：控制在合理范围
+            # 使用较大的偏移量 (0.1) 防止分数为 0 时惩罚爆炸
+            # 当分数=均值时，Penalty ≈ 1.0
+            penalty_vec = 1.0 / (torch.abs(norm_scores) + 0.1)
+            
+            # 计算稀疏损失 (Heads)
+            # 对每个 Head 计算 L2 范数并加权
+            for h in range(num_heads):
+                loss_adaptive_sparse += penalty_vec[h] * torch.norm(mask_tensor[:, h, :], p=2)
+            
+            total_prunable_elements += num_heads
+
+        # --- B. 处理 MLP ---
+        if hasattr(block, 'mlp') and isinstance(block.mlp, MaskedMlp):
+            mask_tensor_mlp = block.mlp.explainability_mask 
+            # 平滑损失
+            if mask_tensor_mlp.shape[0] > 1:
+                loss_smooth += torch.norm(mask_tensor_mlp[1:] - mask_tensor_mlp[:-1], p=1)
+            
+            hidden_dim = mask_tensor_mlp.shape[1]
+            
+            # 获取 Neuron 分数
+            mlp_keys = [f'blocks.{block_idx}.mlp.neuron.{n}' for n in range(hidden_dim)]
+            # 若缺失默认为均值
+            raw_scores_mlp = [scfp_scores.get(k, neuron_score_mean) for k in mlp_keys] 
+            raw_scores_tensor_mlp = torch.tensor(raw_scores_mlp, device=device)
+            
+            # [归一化 1] 分数归一化
+            norm_scores_mlp = raw_scores_tensor_mlp / (neuron_score_mean + epsilon)
+            
+            # [归一化 2] 惩罚权重
+            penalty_vec_mlp = 1.0 / (torch.abs(norm_scores_mlp) + 0.1)
+            
+            # 向量化计算 Mask 列范数 [hidden_dim]
+            mask_col_norms = torch.norm(mask_tensor_mlp, p=2, dim=0)
+            
+            # 加权求和
+            loss_adaptive_sparse += torch.sum(penalty_vec_mlp * mask_col_norms)
+            
+            total_prunable_elements += hidden_dim
+
+    # [归一化 3] 对总 Loss 取平均
+    # 将累积的和除以总单元数。这样 Loss 的量级大约是单个 Mask 的 L2 范数 (约 10.0)
+    if total_prunable_elements > 0:
+        loss_adaptive_sparse = loss_adaptive_sparse / total_prunable_elements
+        # 平滑损失也建议归一化，防止层数多了之后过大
+        loss_smooth = loss_smooth / total_prunable_elements
 
     # 总损失
     total_loss = loss_ce + lambda_sp * loss_adaptive_sparse + lambda_sm * loss_smooth
@@ -152,18 +226,27 @@ def calculate_total_loss_re_pruner(
 # --- RE-Pruner: 结束 ---
 
 # 冻结模型原始权重
+# 冻结除 掩码 和 分类头 以外的所有参数
 for name, param in model.named_parameters():
-    if "explainability_mask" not in name:
-        param.requires_grad = False
+    if "explainability_mask" in name:
+        param.requires_grad = True  # 训练掩码
+    elif "head" in name:
+        param.requires_grad = True  # 必须训练分类头，因为它目前是随机的！
+    else:
+        param.requires_grad = False # 冻结主干权重
 
-# 确认只有掩码是可训练的
+# 确认只有掩码(以及分类头)是可训练的
 print("以下参数将被训练:")
 for name, param in model.named_parameters():
     if param.requires_grad:
         print(name)
 
-# 优化器只包含掩码参数
-optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=LEARNING_RATE, momentum=0.9)
+# 优化器只包含掩码参数(以及分类头)
+optimizer = torch.optim.SGD(
+    filter(lambda p: p.requires_grad, model.parameters()), 
+    lr=LEARNING_RATE, 
+    momentum=0.9
+)
 ce_loss_fn = nn.CrossEntropyLoss()
 
 # --- 6. 训练循环 ---
@@ -188,7 +271,9 @@ for epoch in range(EPOCHS):
             LAMBDA_SM,
             delta_f_scores, # 传入加载的分数
             device,         
-            epsilon         
+            epsilon,
+            HEAD_SCORE_MEAN,
+            NEURON_SCORE_MEAN         
         )
         
         loss.backward()

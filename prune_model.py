@@ -11,7 +11,7 @@ from timm.models.vision_transformer import VisionTransformer, Block as TimmBlock
 from timm.layers import DropPath, Mlp, to_2tuple # <-- 导入 DropPath 和 Mlp
 
 # --- 配置 ---
-PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_r_logit_100class_r0.5.pth"
+PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.4.pth"
 FINAL_MODEL_PATH = "re_pruner_PHYSICALLY_pruned.pth"
 
 NUM_CLASSES = 100
@@ -28,43 +28,69 @@ if not os.path.exists(PHASE2_MODEL_PATH):
     raise FileNotFoundError(f"模型文件 {PHASE2_MODEL_PATH} 不存在。")
 state_dict = torch.load(PHASE2_MODEL_PATH, map_location=device)
 
-# --- 2. 计算每层要保留的头的索引 ---
+# --- 2. 计算保留索引 (Head 和 Neuron) ---
 print("--- 正在计算要保留的注意力头 (结构化) ---")
 pruning_config = {}
 total_heads_before = 0
 total_heads_after = 0
+total_neurons_before = 0
+total_neurons_after = 0
 
 for i in range(NUM_BLOCKS):
-    r_logit = state_dict[f'blocks.{i}.attn.r_logit']
-    mask_scores = state_dict[f'blocks.{i}.attn.explainability_mask']
+    config = {}
     
-    num_heads = mask_scores.shape[1]
-    r = torch.sigmoid(r_logit).item()
-    num_heads_to_keep = int(round((1.0 - r) * num_heads))
-    num_heads_to_keep = max(1, num_heads_to_keep) 
+    # A. 处理 Attention
+    theta_attn = state_dict.get(f'blocks.{i}.attn.theta').item()
+    mask_attn = state_dict[f'blocks.{i}.attn.explainability_mask']
+    importance_attn = mask_attn.mean(dim=0).abs().sum(dim=-1)
+    kept_heads = torch.nonzero(importance_attn > theta_attn).squeeze(1).tolist()
+    if not kept_heads: kept_heads = [torch.argmax(importance_attn).item()]
+    config['heads'] = sorted(kept_heads)
     
-    head_importance = mask_scores.mean(dim=0).sum(dim=1)
-    _, top_k_indices = torch.topk(head_importance, k=num_heads_to_keep)
-    top_k_indices = sorted(top_k_indices.tolist()) 
-    
-    pruning_config[i] = top_k_indices 
-    
-    print(f"Block {i}: 目标剪枝率 r={r:.4f}。保留 {num_heads_to_keep}/{num_heads} 个头。保留索引: {top_k_indices}")
-    total_heads_before += num_heads
-    total_heads_after += num_heads_to_keep
+    # B. 处理 MLP
+    theta_mlp = state_dict.get(f'blocks.{i}.mlp.theta').item()
+    mask_mlp = state_dict[f'blocks.{i}.mlp.explainability_mask']
+    importance_mlp = mask_mlp.mean(dim=0).abs() # MLP 只有 [hidden_dim]
+    kept_neurons = torch.nonzero(importance_mlp > theta_mlp).squeeze(1).tolist()
+    if not kept_neurons: kept_neurons = [torch.argmax(importance_mlp).item()]
+    config['neurons'] = sorted(kept_neurons)
 
-print(f"\n总计：剪枝前共 {total_heads_before} 个头, 剪枝后保留 {total_heads_after} 个头。")
-print(f"头部参数稀疏度: {(total_heads_before - total_heads_after) / total_heads_before:.2%}")
+    # 获取 MLP 统计信息
+    n_neurons_total = mask_mlp.shape[1]
+    n_neurons_kept = len(config['neurons'])
+    # 获取 Attention 统计信息
+    n_heads_total = mask_attn.shape[1]
+    n_heads_kept = len(config['heads'])
+
+    pruning_config[i] = config
+    # 更新总计数
+    total_heads_before += n_heads_total
+    total_heads_after += n_heads_kept
+    total_neurons_before += n_neurons_total
+    total_neurons_after += n_neurons_kept
+    # 打印当前层的详细信息
+    print(f"Block {i}: "
+          f"Heads={n_heads_kept}/{n_heads_total} (Pruned: {1 - n_heads_kept/n_heads_total:.2%}), "
+          f"Neurons={n_neurons_kept}/{n_neurons_total} (Pruned: {1 - n_neurons_kept/n_neurons_total:.2%})")
+
+# 打印全局统计信息
+print("-" * 60)
+print(f"Total Heads:   {total_heads_after}/{total_heads_before} "
+      f"(Global Pruned: {1 - total_heads_after/total_heads_before:.2%})")
+print(f"Total Neurons: {total_neurons_after}/{total_neurons_before} "
+      f"(Global Pruned: {1 - total_neurons_after/total_neurons_before:.2%})")
+print("-" * 60)
+
 
 # --- 3. 创建一个新的、物理上更小的模型并复制权重 ---
 print("\n--- 正在创建并填充 *物理上* 剪枝后的模型 ---")
 
 # 计算每层最终保留的头数量（按顺序），用于构建物理上剪枝后的模型
-new_head_counts = [len(pruning_config[i]) for i in range(NUM_BLOCKS)]
+new_head_counts = [len(pruning_config[i]['heads']) for i in range(NUM_BLOCKS)]
 print(f"每层保留的头数: {new_head_counts}")
 
 # --- *** ---
-# !!! 关键修复点：定义我们自己的 PrunedAttention 和 PrunedBlock !!!
+# 定义我们自己的 PrunedAttention 和 PrunedBlock !!!
 # --- *** ---
 
 class PrunedAttention(TimmAttention):
@@ -107,36 +133,27 @@ class PrunedAttention(TimmAttention):
         return x
 
 class PrunedBlock(TimmBlock):
-    """
-    一个继承自 timm Block 的类，
-    但确保它使用我们自定义的 PrunedAttention。
-    """
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, proj_bias=True,
+    # 修改 init，增加 mlp_ratio=None 以兼容调用，但实际使用 mlp_hidden_dim
+    def __init__(self, dim, num_heads, mlp_hidden_dim, qkv_bias=False, proj_bias=True,
                  proj_drop=0., attn_drop=0., drop_path=0., 
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
-        # 同样，只调用 nn.Module 的 __init__
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, mlp_ratio=None): 
         super(TimmBlock, self).__init__()
         self.norm1 = norm_layer(dim)
-        # 关键：使用我们自定义的 PrunedAttention
         self.attn = PrunedAttention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, proj_bias=proj_bias,
             attn_drop=attn_drop, proj_drop=proj_drop)
-        
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        # 关键：使用 timm.Mlp 并正确传递参数
+        
+        # 关键：使用传入的具体维度构建 MLP
         self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=mlp_hidden_dim,
-            act_layer=act_layer,
-            bias=proj_bias,
-            drop=proj_drop,
+            in_features=dim, 
+            hidden_features=mlp_hidden_dim, 
+            act_layer=act_layer, bias=proj_bias, drop=proj_drop
         )
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 重写 forward 以匹配 PrunedAttention (它不接受 y_labels 或 attn_mask)
         x = x + self.drop_path1(self.attn(self.norm1(x)))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
@@ -146,7 +163,7 @@ class PrunedVisionTransformer(VisionTransformer):
     一个继承自 timm VisionTransformer 的类，
     但使用我们自定义的 PrunedBlock 列表。
     """
-    def __init__(self, head_counts_per_block, **kwargs):
+    def __init__(self, head_counts_per_block, neuron_counts_per_block, **kwargs):
         # 提取 kwargs *之前* 调用 super()
         depth = len(head_counts_per_block)
         drop_path_rate = kwargs.get('drop_path_rate', 0.)
@@ -172,8 +189,9 @@ class PrunedVisionTransformer(VisionTransformer):
         self.blocks = nn.ModuleList([
             PrunedBlock( 
                 dim=kwargs['embed_dim'], 
-                num_heads=head_counts_per_block[i], # <-- 传入每层的新头数量
-                mlp_ratio=mlp_ratio,
+                num_heads=head_counts_per_block[i],
+                mlp_hidden_dim=neuron_counts_per_block[i],
+                mlp_ratio=None,
                 qkv_bias=qkv_bias,
                 proj_bias=proj_bias,
                 proj_drop=proj_drop_rate,
@@ -199,10 +217,17 @@ class PrunedVisionTransformer(VisionTransformer):
         
         x = self.norm(x)
         return x
+    
+new_head_counts = [len(pruning_config[i]['heads']) for i in range(NUM_BLOCKS)]
+new_neuron_counts = [len(pruning_config[i]['neurons']) for i in range(NUM_BLOCKS)] # <--- 新增
+
+print(f"Heads per layer: {new_head_counts}")
+print(f"Neurons per layer: {new_neuron_counts}")
 
 # --- 实例化新模型 ---
 pruned_model = PrunedVisionTransformer(
     head_counts_per_block=new_head_counts,
+    neuron_counts_per_block=new_neuron_counts,
     patch_size=16,
     embed_dim=BASE_EMBED_DIM,
     depth=NUM_BLOCKS, 
@@ -217,68 +242,100 @@ pruned_model = PrunedVisionTransformer(
 pruned_model.eval()
 pruned_state_dict = pruned_model.state_dict()
 
-# --- 复制权重 (现在键名和形状应该匹配了) ---
+# --- 复制权重 (修复版) ---
+print("正在开始权重复制与结构化剪枝...")
 new_state_dict = OrderedDict()
+
 for (old_name, old_param) in state_dict.items():
     
-    # 1. 重命名键
+    # 1. 重命名键 (去除中间的 .attn. 和 .mlp.)
+    new_name = old_name
     if ".attn.attn." in old_name:
         new_name = old_name.replace(".attn.attn.", ".attn.", 1)
-    else:
-        new_name = old_name
+    elif ".mlp.mlp." in old_name:
+        new_name = old_name.replace(".mlp.mlp.", ".mlp.", 1)
 
-    # 2. 复制非注意力参数
-    if "attn" not in new_name:
-        if new_name in pruned_state_dict and pruned_state_dict[new_name].shape == old_param.shape:
-            new_state_dict[new_name] = old_param
+    # 忽略不再需要的参数 (mask, theta, r_logit 等)
+    if any(x in new_name for x in ["explainability_mask", "theta", "r_logit", "is_pruning_phase"]):
+        continue
+
+    # 2. 复制非 Block 参数 (如 Patch Embed, Cls Token, Norm, Head 等)
+    if "blocks." not in new_name:
+        if new_name in pruned_state_dict:
+            # 简单的形状检查
+            if pruned_state_dict[new_name].shape == old_param.shape:
+                new_state_dict[new_name] = old_param
+            else:
+                print(f"跳过不匹配参数: {new_name} {old_param.shape} vs {pruned_state_dict[new_name].shape}")
         continue 
     
-    # 3. 复制 *注意力* 参数 (结构化切片)
+    # 3. 复制 Block 参数 (结构化切片)
+    # 提取 block index
+    parts = new_name.split('.')
+    block_idx_str = parts[1] # blocks.0...
+    if not block_idx_str.isdigit(): 
+        continue
+    block_idx = int(block_idx_str)
+    
+    # 获取当前层的保留索引配置
+    # [关键修复]：从字典中分别提取 heads 和 neurons
+    heads_to_keep = pruning_config[block_idx]['heads']
+    neurons_to_keep = pruning_config[block_idx]['neurons']
+    
+    # --- A. 处理 Attention 权重 ---
     if "attn.qkv.weight" in new_name:
-        block_idx = int(new_name.split('.')[1])
-        indices_to_keep = pruning_config[block_idx]
-        
+        # Shape: [3*H*D, C] -> Reshape -> Slice -> Flatten
         old_qkv = old_param.view(3, BASE_NUM_HEADS, HEAD_DIM, BASE_EMBED_DIM)
-        new_qkv = old_qkv[:, indices_to_keep, :, :]
+        new_qkv = old_qkv[:, heads_to_keep, :, :] # Slice heads
         new_qkv = new_qkv.reshape(-1, BASE_EMBED_DIM) 
-        
-        if new_qkv.shape == pruned_state_dict[new_name].shape:
-            new_state_dict[new_name] = new_qkv
-        else:
-            print(f"形状不匹配! {new_name}: {new_qkv.shape} vs {pruned_state_dict[new_name].shape}")
+        new_state_dict[new_name] = new_qkv
 
     elif "attn.qkv.bias" in new_name:
-        block_idx = int(new_name.split('.')[1])
-        indices_to_keep = pruning_config[block_idx]
-
+        # Shape: [3*H*D]
         old_bias = old_param.view(3, BASE_NUM_HEADS, HEAD_DIM)
-        new_bias = old_bias[:, indices_to_keep, :]
+        new_bias = old_bias[:, heads_to_keep, :]
         new_bias = new_bias.reshape(-1) 
-        
-        if new_bias.shape == pruned_state_dict[new_name].shape:
-            new_state_dict[new_name] = new_bias
-        else:
-            print(f"形状不匹配! {new_name}: {new_bias.shape} vs {pruned_state_dict[new_name].shape}")
+        new_state_dict[new_name] = new_bias
 
     elif "attn.proj.weight" in new_name:
-        block_idx = int(new_name.split('.')[1])
-        indices_to_keep = pruning_config[block_idx]
-        
+        # Shape: [C, H*D] -> View [C, H, D] -> Slice -> Flatten
         old_proj = old_param.view(BASE_EMBED_DIM, BASE_NUM_HEADS, HEAD_DIM)
-        new_proj = old_proj[:, indices_to_keep, :] 
+        new_proj = old_proj[:, heads_to_keep, :] 
         new_proj = new_proj.reshape(BASE_EMBED_DIM, -1) 
-        
-        if new_proj.shape == pruned_state_dict[new_name].shape:
-            new_state_dict[new_name] = new_proj
-        else:
-            print(f"形状不匹配! {new_name}: {new_proj.shape} vs {pruned_state_dict[new_name].shape}")
+        new_state_dict[new_name] = new_proj
 
     elif "attn.proj.bias" in new_name:
+        # Proj bias 形状是 [Embed_Dim]，不受 Head 数量影响，直接复制
         new_state_dict[new_name] = old_param
+
+    # --- B. 处理 MLP 权重 ---
+    elif "mlp.fc1.weight" in new_name:
+        # FC1 Weight: [Hidden, Embed] -> Slice rows (neurons)
+        # 这里的 hidden 维度对应输出维度 (dim 0)
+        new_state_dict[new_name] = old_param[neurons_to_keep, :]
+        
+    elif "mlp.fc1.bias" in new_name:
+        # FC1 Bias: [Hidden] -> Slice elements
+        new_state_dict[new_name] = old_param[neurons_to_keep]
+        
+    elif "mlp.fc2.weight" in new_name:
+        # FC2 Weight: [Embed, Hidden] -> Slice cols (neurons)
+        # 这里的 hidden 维度对应输入维度 (dim 1)
+        new_state_dict[new_name] = old_param[:, neurons_to_keep]
+        
+    elif "mlp.fc2.bias" in new_name:
+        # FC2 Bias: [Embed] -> 不受 Neuron 数量影响，直接复制
+        new_state_dict[new_name] = old_param
+
+    # --- C. 其他 Block 参数 (Norm 等) ---
+    else:
+        # 主要是 norm1, norm2, ls1, ls2 等，形状通常是 [Embed_Dim]，直接复制
+        if new_name in pruned_state_dict:
+             new_state_dict[new_name] = old_param
             
 # --- 加载新的状态字典 ---
 try:
-    pruned_model.load_state_dict(new_state_dict, strict=True) # <-- 使用 strict=True 确保所有键都匹配
+    pruned_model.load_state_dict(new_state_dict, strict=True)
     print("\n--- 成功：state_dict 键名和形状完全匹配！---")
     
     torch.save(pruned_model.state_dict(), FINAL_MODEL_PATH)
@@ -288,4 +345,3 @@ try:
 except RuntimeError as e:
     print("\n--- 错误：加载 state_dict 失败 ---")
     print(e)
-    print("\n请检查上面的日志，确保所有形状都匹配。")

@@ -22,7 +22,7 @@ NUM_HEADS = 6
 HEAD_DIM = EMBED_DIM // NUM_HEADS
 
 # 训练参数
-BATCH_SIZE = 64 # 根据您的GPU显存调整
+BATCH_SIZE = 128
 NUM_WORKERS = 4
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 OUTPUT_FILE = f'scfp_head_scores_{MODEL_NAME}.pt'
@@ -80,7 +80,13 @@ def get_fisher_scores(model, data_loader, device):
         for h in range(NUM_HEADS):
             key = f'blocks.{i}.attn.head.{h}'
             fisher_scores[key] = 0.0
-
+    # MLP Neurons
+        # 获取 MLP 隐藏层维度 (DeiT-Small: 384 * 4 = 1536)
+        # 注意：这里假设所有Block结构相同，取第一个Block的维度即可
+        # 如果模型尚未加载到 device，可能需要先通过 model.blocks[0].mlp.fc1.out_features 获取
+        hidden_dim = model.blocks[i].mlp.fc1.out_features
+        for n in range(hidden_dim):
+            fisher_scores[f'blocks.{i}.mlp.neuron.{n}'] = 0.0
     criterion = nn.CrossEntropyLoss().to(device)
     model.train() # 确保开启训练模式以计算梯度
 
@@ -122,12 +128,30 @@ def get_fisher_scores(model, data_loader, device):
                 
                 # 累加到字典中
                 fisher_scores[key] += total_head_score.item()
-        
+            # --- B. 新增：处理 MLP ---
+            # MLP 结构通常是: FC1 (In -> Hidden) -> Act -> FC2 (Hidden -> Out)
+            # 我们要评估中间 Hidden Neurons 的重要性
+            
+            # 1. 获取梯度平方
+            fc1_grad_sq = block.mlp.fc1.weight.grad.pow(2) # Shape: [Hidden, In]
+            fc2_grad_sq = block.mlp.fc2.weight.grad.pow(2) # Shape: [Out, Hidden]
+            
+            # 2. 聚合到 Hidden 维度 (Neuron)
+            # FC1: 对输入维度求和 (dim=1) -> [Hidden]
+            fc1_neuron_scores = fc1_grad_sq.sum(dim=1)
+            # FC2: 对输出维度求和 (dim=0) -> [Hidden]
+            fc2_neuron_scores = fc2_grad_sq.sum(dim=0)
+            
+            # 3. 总分 = FC1贡献 + FC2贡献
+            total_neuron_scores = fc1_neuron_scores + fc2_neuron_scores # [Hidden]
+
+            hidden_dim = total_neuron_scores.shape[0]
+            for n in range(hidden_dim):
+                key = f'blocks.{block_idx}.mlp.neuron.{n}'
+                fisher_scores[key] += total_neuron_scores[n].item()
+
         num_batches += 1
-        # --- (可选) 为了节省时间，可以只运行一部分数据 ---
-        # if num_batches > 1000: 
-        #     print("注意：为节省时间，仅使用了部分数据...")
-        #     break
+
         
     # 计算平均值 (期望)
     for key in fisher_scores:
