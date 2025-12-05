@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import argparse
+import numpy as np
 from deit_modified import deit_small_patch16_224
 from vision_transformer_modified import MaskedAttention, MaskedMlp 
 from utils_cifar import get_cifar10_loaders # <---
@@ -10,6 +11,10 @@ from utils_cifar import get_cifar10_loaders # <---
 # --- 增加参数解析 ---
 parser = argparse.ArgumentParser(description='RE-Pruner Phase 2 for CIFAR-10')
 parser.add_argument('--pruning_rate', type=float, default=0.4, help='Target pruning rate')
+
+parser.add_argument('--lambda_prune', type=float, default=200.0, help='Weight for pruning loss')
+parser.add_argument('--lr_lagrange', type=float, default=0.05, help='Learning rate for beta/gamma')
+args = parser.parse_args()
 args = parser.parse_args()
 
 # --- 1. 定义超参数和配置 ---
@@ -29,8 +34,9 @@ model = deit_small_patch16_224(pretrained=False, num_classes=NUM_CLASSES)
 print(f"正在从 {MODEL_STATE_PATH} 加载模型状态...")
 model.load_state_dict(torch.load(MODEL_STATE_PATH, map_location=device), strict=False)
 model.to(device)
-
-print("正在初始化剪枝阈值 (theta)...")
+print("加载成功！")
+# 1. 初始化 Theta (同时处理 Attention 和 MLP)
+print(f"正在根据目标剪枝率 {ALPHA_TARGET} 初始化 Theta (Smart Init)...")
 with torch.no_grad():
     for name, module in model.named_modules():
         if isinstance(module, (MaskedAttention, MaskedMlp)): 
@@ -39,13 +45,28 @@ with torch.no_grad():
                 scores = module.get_head_importance()
             else:
                 scores = module.get_neuron_importance()
-            mean_score = scores.mean()
-            module.theta.data.fill_(mean_score.item())
+            
+            # 计算分位数初始化
+            scores_np = scores.detach().cpu().numpy().flatten()
+            # 如果目标是剪掉 40% (Alpha=0.4)，我们将阈值设在 40% 分位数
+            # 注意：np.percentile 接受 0-100 的值
+            init_threshold = np.percentile(scores_np, ALPHA_TARGET * 100)
+            
+            module.theta.data.fill_(init_threshold)
+            
+    # 打印部分初始化结果用于验证
+    for name, module in list(model.named_modules())[:5]:
+         if isinstance(module, (MaskedAttention, MaskedMlp)):
+             print(f"  -> {name}: Theta initialized to {module.theta.item():.4f}")
 
 # 激活剪枝模式
+num_prunable_elements = 0
 for module in model.modules():
     if isinstance(module, MaskedAttention):
         module.is_pruning_phase = True
+        num_prunable_elements += module.explainability_mask.numel()
+
+print(f"总可剪枝参数元素 (来自掩码): {num_prunable_elements}")
 
 # --- 4. 设置损失函数和优化器 (完全保持原逻辑) ---
 ce_loss_fn = nn.CrossEntropyLoss()
@@ -58,7 +79,7 @@ def calculate_pruning_loss(model, alpha_target, beta, gamma):
     WEIGHT_HEAD = 128.0
     WEIGHT_NEURON = 1.0
     loss_theta_boundary = torch.tensor(0.0, device=device)
-    MIN_RETENTION_RATIO = 0.25 
+    MIN_RETENTION_RATIO = 0.15 
     
     for module in model.modules():
         if isinstance(module, MaskedAttention):
@@ -107,7 +128,12 @@ model_weights.append(beta)
 model_weights.append(gamma)
         
 optimizer_weights = torch.optim.AdamW(model_weights, lr=1e-5)
-optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.005)
+optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.01)
+
+print(f"模型权重参数组大小: {len(model_weights)}")
+print(f"剪枝参数组大小: {len(pruning_params)}")
+if not pruning_params:
+    print("警告：未找到名为 'theta' 的剪枝参数。请检查 'vision_transformer_modified.py'。")
 
 # --- 5. 第二阶段训练循环 ---
 model.train()
@@ -126,15 +152,15 @@ for epoch in range(EPOCHS):
         loss_ce = ce_loss_fn(outputs, labels)
         loss_r, current_R_val = calculate_pruning_loss(model, ALPHA_TARGET, beta, gamma)
         
-        lambda_prune = 80.0
-        total_loss = loss_ce + lambda_prune * loss_r
+        
+        total_loss = loss_ce + args.lambda_prune * loss_r
         total_loss.backward()
         
         optimizer_weights.step()
         optimizer_pruning.step()
 
         with torch.no_grad():
-            lr_lagrange = 0.01
+            lr_lagrange = args.lr_lagrange
             if beta.grad is not None:
                 beta.data.add_(lr_lagrange * beta.grad)
                 beta.grad.zero_()
@@ -145,10 +171,16 @@ for epoch in range(EPOCHS):
             gamma.data.clamp_(min=0)
             
             if i % 100 == 0:
-                print(f"Epoch [{epoch+1}/{EPOCHS}], Step [{i}], Total: {total_loss.item():.4f}, Current R: {current_R_val.item():.4f}")
+                
+                print(f"Epoch [{epoch+1}/{EPOCHS}], Step [{i+1}/{len(train_loader)}], Total: {total_loss.item():.4f}, "
+                    f"CE: {loss_ce.item():.4f}, PruningLoss(raw): {loss_r.item():.4f}, "
+                    f"Current R: {current_R_val.item():.4f}"
+                    f"  -> beta: {beta.item():.6f}, gamma: {gamma.item():.6f}")
 
 print("第二阶段训练完成!")
+
 # 文件名带上 pruning_rate
 output_filename = f"re_pruner_phase2_cifar10_r{ALPHA_TARGET}.pth" 
 print(f"正在将模型状态保存到: {output_filename} ...")
 torch.save(model.state_dict(), output_filename)
+print("保存成功！")

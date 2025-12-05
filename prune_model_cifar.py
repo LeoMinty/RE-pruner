@@ -33,7 +33,13 @@ if not os.path.exists(PHASE2_MODEL_PATH):
 state_dict = torch.load(PHASE2_MODEL_PATH, map_location=device)
 
 # --- 2. 计算保留索引 (保持原逻辑) ---
+print("--- 正在计算要保留的注意力头 (结构化) ---")
 pruning_config = {}
+total_heads_before = 0
+total_heads_after = 0
+total_neurons_before = 0
+total_neurons_after = 0
+
 for i in range(NUM_BLOCKS):
     config = {}
     
@@ -51,12 +57,37 @@ for i in range(NUM_BLOCKS):
     if not kept_neurons: kept_neurons = [torch.argmax(importance_mlp).item()]
     config['neurons'] = sorted(kept_neurons)
 
-    pruning_config[i] = config
+    # 获取 MLP 统计信息
+    n_neurons_total = mask_mlp.shape[1]
+    n_neurons_kept = len(config['neurons'])
+    # 获取 Attention 统计信息
+    n_heads_total = mask_attn.shape[1]
+    n_heads_kept = len(config['heads'])
 
+    pruning_config[i] = config
+    # 更新总计数
+    total_heads_before += n_heads_total
+    total_heads_after += n_heads_kept
+    total_neurons_before += n_neurons_total
+    total_neurons_after += n_neurons_kept
+    # 打印当前层的详细信息
+    print(f"Block {i}: "
+          f"Heads={n_heads_kept}/{n_heads_total} (Pruned: {1 - n_heads_kept/n_heads_total:.2%}), "
+          f"Neurons={n_neurons_kept}/{n_neurons_total} (Pruned: {1 - n_neurons_kept/n_neurons_total:.2%})")
+# 打印全局统计信息
+print("-" * 60)
+print(f"Total Heads:   {total_heads_after}/{total_heads_before} "
+      f"(Global Pruned: {1 - total_heads_after/total_heads_before:.2%})")
+print(f"Total Neurons: {total_neurons_after}/{total_neurons_before} "
+      f"(Global Pruned: {1 - total_neurons_after/total_neurons_before:.2%})")
+print("-" * 60)
+
+# --- 3. 创建一个新的、物理上更小的模型并复制权重 ---
+print("\n--- 正在创建并填充 *物理上* 剪枝后的模型 ---")
+
+# 计算每层最终保留的头数量（按顺序），用于构建物理上剪枝后的模型
 new_head_counts = [len(pruning_config[i]['heads']) for i in range(NUM_BLOCKS)]
-new_neuron_counts = [len(pruning_config[i]['neurons']) for i in range(NUM_BLOCKS)]
-print(f"Heads per layer: {new_head_counts}")
-print(f"Neurons per layer: {new_neuron_counts}")
+print(f"每层保留的头数: {new_head_counts}")
 
 # --- 3. 定义 Pruned 类 (完全复制原代码) ---
 class PrunedAttention(TimmAttention):
@@ -110,6 +141,7 @@ class PrunedVisionTransformer(VisionTransformer):
         depth = len(head_counts_per_block)
         drop_path_rate = kwargs.get('drop_path_rate', 0.)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        mlp_ratio = kwargs.get('mlp_ratio', 4.)
         qkv_bias = kwargs.get('qkv_bias', True)
         proj_bias = kwargs.get('proj_bias', True) 
         attn_drop_rate = kwargs.get('attn_drop_rate', 0.)
@@ -150,6 +182,12 @@ class PrunedVisionTransformer(VisionTransformer):
         x = self.norm(x)
         return x
 
+new_head_counts = [len(pruning_config[i]['heads']) for i in range(NUM_BLOCKS)]
+new_neuron_counts = [len(pruning_config[i]['neurons']) for i in range(NUM_BLOCKS)] # <--- 新增
+
+print(f"Heads per layer: {new_head_counts}")
+print(f"Neurons per layer: {new_neuron_counts}")
+
 # --- 4. 实例化和权重复制 (完全复制原代码) ---
 pruned_model = PrunedVisionTransformer(
     head_counts_per_block=new_head_counts,
@@ -162,6 +200,7 @@ pruned_model = PrunedVisionTransformer(
 pruned_model.eval()
 pruned_state_dict = pruned_model.state_dict()
 
+print("正在开始权重复制与结构化剪枝...")
 new_state_dict = OrderedDict()
 for (old_name, old_param) in state_dict.items():
     new_name = old_name
@@ -175,11 +214,18 @@ for (old_name, old_param) in state_dict.items():
 
     if "blocks." not in new_name:
         if new_name in pruned_state_dict:
-            new_state_dict[new_name] = old_param
+            # 简单的形状检查
+            if pruned_state_dict[new_name].shape == old_param.shape:
+                new_state_dict[new_name] = old_param
+            else:
+                print(f"跳过不匹配参数: {new_name} {old_param.shape} vs {pruned_state_dict[new_name].shape}")
         continue 
     
     parts = new_name.split('.')
-    block_idx = int(parts[1])
+    block_idx_str = parts[1] # blocks.0...
+    if not block_idx_str.isdigit(): 
+        continue
+    block_idx = int(block_idx_str)
     heads_to_keep = pruning_config[block_idx]['heads']
     neurons_to_keep = pruning_config[block_idx]['neurons']
     
@@ -212,6 +258,15 @@ for (old_name, old_param) in state_dict.items():
         if new_name in pruned_state_dict:
              new_state_dict[new_name] = old_param
 
-pruned_model.load_state_dict(new_state_dict, strict=True)
-torch.save(pruned_model.state_dict(), FINAL_MODEL_PATH)
-print(f"物理剪枝模型已保存到 {FINAL_MODEL_PATH}")
+# --- 加载新的状态字典 ---
+try:
+    pruned_model.load_state_dict(new_state_dict, strict=True)
+    print("\n--- 成功：state_dict 键名和形状完全匹配！---")
+    
+    torch.save(pruned_model.state_dict(), FINAL_MODEL_PATH)
+    print(f"\n物理剪枝后的模型已保存到 {FINAL_MODEL_PATH}")
+    print("这个模型现在物理上更小了，可以用于微调和FLOPs分析。")
+
+except RuntimeError as e:
+    print("\n--- 错误：加载 state_dict 失败 ---")
+    print(e)
