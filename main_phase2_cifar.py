@@ -12,8 +12,8 @@ from utils_cifar import get_cifar10_loaders # <---
 parser = argparse.ArgumentParser(description='RE-Pruner Phase 2 for CIFAR-10')
 parser.add_argument('--pruning_rate', type=float, default=0.4, help='Target pruning rate')
 
-parser.add_argument('--lambda_prune', type=float, default=200.0, help='Weight for pruning loss')
-parser.add_argument('--lr_lagrange', type=float, default=0.05, help='Learning rate for beta/gamma')
+parser.add_argument('--lambda_prune', type=float, default=100.0, help='Weight for pruning loss')
+parser.add_argument('--lr_lagrange', type=float, default=0.02, help='Learning rate for beta/gamma')
 args = parser.parse_args()
 args = parser.parse_args()
 
