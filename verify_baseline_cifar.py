@@ -1,11 +1,15 @@
-# verify_baseline_cifar.py
+# finetune_cifar.py
 import torch
 import torch.nn as nn
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 import timm
-import argparse
 import os
+from tqdm import tqdm
+from functools import partial
+import argparse
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from utils_cifar import get_cifar10_loaders
+from utils_cifar import get_cifar10_loaders # <---
 
 # --- 配置 ---
 parser = argparse.ArgumentParser()
@@ -16,7 +20,7 @@ args = parser.parse_args()
 NUM_CLASSES = 10
 BATCH_SIZE = 128
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+device = DEVICE     
 # --- 1. 加载全量模型 (ImageNet Pretrained) ---
 print(f"正在加载全量 DeiT-Small (ImageNet Pretrained)...")
 # 这里的模型没有经过任何修改，是标准的 timm 模型
@@ -36,17 +40,40 @@ criterion = nn.CrossEntropyLoss()
 
 # --- 4. 验证函数 ---
 @torch.no_grad()
-def validate(model, loader):
+def validate(model, loader, criterion, device):
     model.eval()
-    correct = 0
+    total_loss = 0
+    correct_1 = 0
+    correct_5 = 0
     total = 0
-    for images, labels in loader:
-        images, labels = images.to(DEVICE), labels.to(DEVICE)
-        outputs = model(images)
-        _, pred = outputs.max(1)
+    
+    pbar = tqdm(loader, desc="验证中")
+    for images, labels in pbar:
+        images, labels = images.to(device), labels.to(device)
+        
+        outputs = model(images) # <-- 正常前向传播
+        
+        loss = criterion(outputs, labels)
+        total_loss += loss.item()
+        
+        _, pred = outputs.topk(5, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(labels.view(1, -1).expand_as(pred))
+
+        correct_1 += correct[:1].reshape(-1).float().sum(0, keepdim=True)
+        correct_5 += correct[:5].reshape(-1).float().sum(0, keepdim=True)
         total += labels.size(0)
-        correct += pred.eq(labels).sum().item()
-    return 100. * correct / total
+        
+        pbar.set_postfix({
+            "Loss": loss.item(), 
+            "Top-1": (100 * correct_1.item() / total),
+            "Top-5": (100 * correct_5.item() / total)
+        })
+
+    avg_loss = total_loss / len(loader)
+    top1_acc = 100 * correct_1.item() / total
+    top5_acc = 100 * correct_5.item() / total
+    return top1_acc
 
 # --- 5. 训练循环 ---
 print(f"--- 开始训练全量 Baseline (LR: {args.lr}) ---")
@@ -69,7 +96,7 @@ for epoch in range(args.epochs):
     scheduler.step()
     
     # 验证
-    acc = validate(model, val_loader)
+    acc = validate(model, val_loader, criterion, device)
     if acc > best_acc:
         best_acc = acc
         torch.save(model.state_dict(), "baseline_cifar10_deit_small.pth")
@@ -78,9 +105,3 @@ for epoch in range(args.epochs):
 
 print(f"\n结论：")
 print(f"当前训练配方下的全量模型上限 (Baseline) 为: {best_acc:.2f}%")
-if best_acc < 95.0:
-    print(">> 警告：Baseline 远低于 98%。")
-    print(">> 原因：缺少 Mixup/Cutmix 数据增强。")
-    print(">> 建议：比较剪枝模型精度时，请以这个 Baseline ({:.2f}%) 为准，而不是论文的 98%。".format(best_acc))
-else:
-    print(">> Baseline 正常。剪枝模型精度低可能是因为剪枝策略问题。")

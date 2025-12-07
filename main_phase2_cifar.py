@@ -12,8 +12,8 @@ from utils_cifar import get_cifar10_loaders # <---
 parser = argparse.ArgumentParser(description='RE-Pruner Phase 2 for CIFAR-10')
 parser.add_argument('--pruning_rate', type=float, default=0.4, help='Target pruning rate')
 
-parser.add_argument('--lambda_prune', type=float, default=100.0, help='Weight for pruning loss')
-parser.add_argument('--lr_lagrange', type=float, default=0.02, help='Learning rate for beta/gamma')
+parser.add_argument('--lambda_prune', type=float, default=1200.0, help='Weight for pruning loss')
+parser.add_argument('--lr_lagrange', type=float, default=0.1, help='Learning rate for beta/gamma')
 args = parser.parse_args()
 args = parser.parse_args()
 
@@ -48,9 +48,18 @@ with torch.no_grad():
             
             # 计算分位数初始化
             scores_np = scores.detach().cpu().numpy().flatten()
-            # 如果目标是剪掉 40% (Alpha=0.4)，我们将阈值设在 40% 分位数
-            # 注意：np.percentile 接受 0-100 的值
-            init_threshold = np.percentile(scores_np, ALPHA_TARGET * 100)
+            # 修改为：总是比目标高 20% - 30% (Over-prune Initialization)
+            # 例如目标 0.3，初始设在 0.5 或 0.6
+            if isinstance(module, MaskedAttention):
+                # 对于 Head，直接初始化在 60% 分位点 (强制剪掉 ~3-4 个头)
+                # 强迫模型从“少头”的状态开始适应
+                init_threshold = np.percentile(scores_np, 70) 
+                print(f"  -> {name} [HEAD]: Force Init at 70% percentile")
+            else:
+                # 对于 MLP，保持原来的激进策略 (目标+20%)
+                init_percentile = min(95, (ALPHA_TARGET + 0.2) * 100)
+                init_threshold = np.percentile(scores_np, init_percentile)
+                print(f"  -> {name} [MLP]: Init at {init_percentile:.1f}% percentile")
             
             module.theta.data.fill_(init_threshold)
             
@@ -70,7 +79,7 @@ print(f"总可剪枝参数元素 (来自掩码): {num_prunable_elements}")
 
 # --- 4. 设置损失函数和优化器 (完全保持原逻辑) ---
 ce_loss_fn = nn.CrossEntropyLoss()
-beta = nn.Parameter(torch.tensor(1.0, device=device))    
+beta = nn.Parameter(torch.tensor(50.0, device=device))    
 gamma = nn.Parameter(torch.tensor(0.01, device=device)) 
 
 def calculate_pruning_loss(model, alpha_target, beta, gamma):
@@ -128,7 +137,7 @@ model_weights.append(beta)
 model_weights.append(gamma)
         
 optimizer_weights = torch.optim.AdamW(model_weights, lr=1e-5)
-optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.01)
+optimizer_pruning = torch.optim.AdamW(pruning_params, lr=0.03)
 
 print(f"模型权重参数组大小: {len(model_weights)}")
 print(f"剪枝参数组大小: {len(pruning_params)}")
@@ -155,9 +164,13 @@ for epoch in range(EPOCHS):
         
         total_loss = loss_ce + args.lambda_prune * loss_r
         total_loss.backward()
-        
-        optimizer_weights.step()
-        optimizer_pruning.step()
+
+        if epoch < 5:
+            optimizer_pruning.step() # 只更新 Theta
+            # optimizer_weights.step() # 跳过权重更新
+        else:
+            optimizer_pruning.step()
+            optimizer_weights.step()
 
         with torch.no_grad():
             lr_lagrange = args.lr_lagrange
