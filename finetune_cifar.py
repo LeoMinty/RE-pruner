@@ -4,6 +4,8 @@ import torch.nn as nn
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 import os
+from timm.data import Mixup
+from timm.loss import SoftTargetCrossEntropy
 from tqdm import tqdm
 from functools import partial
 import argparse
@@ -22,56 +24,59 @@ RATE = args.pruning_rate
 
 # --- 1. 配置 ---
 NUM_CLASSES = 10 # <---
-BATCH_SIZE = 128
-FINETUNE_EPOCHS = 30
+BATCH_SIZE = 128 * 2
+FINETUNE_EPOCHS = 100
 FINETUNE_LR = 5e-4
 WEIGHT_DECAY = 1e-4    # 保持 AdamW 的默认权重衰减
-
+BASE_NUM_HEADS = 6
+BASE_EMBED_DIM = 384
+HEAD_DIM = 64
 # 注意：这里需要加载 PHASE2 的模型来计算结构，同时也加载物理剪枝后的权重
 # 文件名根据 rate 变化
 PHASE2_MODEL_PATH = f"re_pruner_phase2_cifar10_r{RATE}.pth" 
 PRUNED_MODEL_PATH = f"re_pruner_physically_pruned_cifar10_r{RATE}.pth"
-# PRUNED_MODEL_PATH = f"re_pruner_finetuned_best_cifar10_r{RATE}.pth"
+# PRUNED_MODEL_PATH = f"re_pruner_finetuned_1_best_cifar10_r{RATE}.pth"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # --- 2. 准备数据集 ---
 train_loader, val_loader = get_cifar10_loaders(BATCH_SIZE)
 
+# 这些参数是 DeiT/ViT 在 CIFAR 上常用的推荐值
+mixup_fn = Mixup(
+    mixup_alpha=0.8,       # mixup 参数
+    cutmix_alpha=1.0,      # cutmix 参数
+    cutmix_minmax=None,
+    prob=1.0,              # 启用概率
+    switch_prob=0.5,       # mixup 和 cutmix 切换概率
+    mode='batch',          #在这个batch中应用
+    label_smoothing=0.1,   # 标签平滑
+    num_classes=NUM_CLASSES
+)
+
 # --- 3. 重建结构 (保持原逻辑) ---
-print("--- 正在重建物理剪枝模型结构 ---")
-if not os.path.exists(PHASE2_MODEL_PATH):
-    raise FileNotFoundError(f"模型文件 {PHASE2_MODEL_PATH} 不存在。")
-state_dict_phase2 = torch.load(PHASE2_MODEL_PATH, map_location=device)
+print(f"正在从 {PRUNED_MODEL_PATH} 推断模型结构...")
+state_dict_pruned = torch.load(PRUNED_MODEL_PATH, map_location=device)
 
 new_head_counts = []
 new_neuron_counts = []
-BASE_NUM_HEADS = 6
-BASE_EMBED_DIM = 384
-HEAD_DIM = 64
 
-for i in range(12): 
-    theta_attn = state_dict_phase2.get(f'blocks.{i}.attn.theta')
-    mask_attn = state_dict_phase2[f'blocks.{i}.attn.explainability_mask']
-    if theta_attn is None: 
-        print(f"Error: Block {i} missing theta")
-        exit()
-    importance_attn = mask_attn.mean(dim=0).abs().sum(dim=-1)
-    kept_heads = torch.nonzero(importance_attn > theta_attn.item()).squeeze(1)
-    n_heads = kept_heads.numel()
-    if n_heads == 0: n_heads = 1
+for i in range(12): # 假设 12 层
+    # 1. 推断 Head 数量 (通过 QKV 权重形状)
+    # qkv weight shape: [3 * heads * head_dim, embed_dim]
+    # DeiT-Small: head_dim=64
+    qkv_weight = state_dict_pruned[f'blocks.{i}.attn.qkv.weight']
+    n_heads = qkv_weight.shape[0] // 3 // 64
     new_head_counts.append(n_heads)
-    
-    theta_mlp = state_dict_phase2.get(f'blocks.{i}.mlp.theta')
-    mask_mlp = state_dict_phase2[f'blocks.{i}.mlp.explainability_mask']
-    importance_mlp = mask_mlp.mean(dim=0).abs()
-    kept_neurons = torch.nonzero(importance_mlp > theta_mlp.item()).squeeze(1)
-    n_neurons = kept_neurons.numel()
-    if n_neurons == 0: n_neurons = 1
+
+    # 2. 推断 Neuron 数量 (通过 FC1 权重形状)
+    # fc1 weight shape: [neurons, embed_dim]
+    fc1_weight = state_dict_pruned[f'blocks.{i}.mlp.fc1.weight']
+    n_neurons = fc1_weight.shape[0]
     new_neuron_counts.append(n_neurons)
 
-print(f"学习到的保留头数量: {new_head_counts}")
-print(f"学习到的保留神经元数量: {new_neuron_counts}")
+print(f"推断出的 Head 数量: {new_head_counts}")
+print(f"推断出的 Neuron 数量: {new_neuron_counts}")
 # 定义类 (为了不依赖外部文件，这里再次定义，或者 import prune_model_cifar)
 # 为了安全起见，这里再贴一遍类定义，确保脚本独立运行不出错
 # (如果您已经将类定义放在一个公共文件中，可以 import，但为了复现您的 finetune.py，我保留完整定义)
@@ -174,8 +179,18 @@ pruned_model = PrunedVisionTransformer(
 print(f"正在从 {PRUNED_MODEL_PATH} 加载 *物理* 剪枝模型权重...")
 if not os.path.exists(PRUNED_MODEL_PATH):
     raise FileNotFoundError(f"模型文件 {PRUNED_MODEL_PATH} 不存在。")
-pruned_model.load_state_dict(torch.load(PRUNED_MODEL_PATH, map_location=device))
+# pruned_model.load_state_dict(torch.load(PRUNED_MODEL_PATH, map_location=device))
+# 加载权重到 CPU (避免显存占用冲突)，稍后再移到 GPU
+state_dict = torch.load(PRUNED_MODEL_PATH, map_location='cpu')
+pruned_model.load_state_dict(state_dict)
+
+# --- [关键修改]：启用双卡并行 ---
+if torch.cuda.device_count() > 1:
+    print(f"检测到 {torch.cuda.device_count()} 张显卡，已启用 DataParallel 并行加速！")
+    pruned_model = nn.DataParallel(pruned_model)
+
 pruned_model.to(device)
+print("模型已加载并移动到设备。")
 print("加载成功！")
 # --- 4. 优化器 ---
 # 使用论文推荐的 AdamW
@@ -185,7 +200,11 @@ optimizer = torch.optim.AdamW(pruned_model.parameters(), lr=FINETUNE_LR, weight_
 # T_max 设为总 Epoch 数，eta_min 设为极小值 (如 1e-6)
 scheduler = CosineAnnealingLR(optimizer, T_max=FINETUNE_EPOCHS, eta_min=1e-6)
 
-criterion = nn.CrossEntropyLoss()
+# criterion = nn.CrossEntropyLoss()
+if mixup_fn is not None:
+    criterion = SoftTargetCrossEntropy()
+else:
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
 
 
@@ -237,6 +256,9 @@ for epoch in range(FINETUNE_EPOCHS):
     for i, (images, labels) in enumerate(pbar):
         images, labels = images.to(device), labels.to(device)
         
+        if mixup_fn is not None:
+            images, labels = mixup_fn(images, labels)
+
         optimizer.zero_grad()
         outputs = pruned_model(images)
         loss = criterion(outputs, labels)
@@ -251,16 +273,21 @@ for epoch in range(FINETUNE_EPOCHS):
     current_lr = optimizer.param_groups[0]['lr']
         
         
-
-    val_loss, val_acc1, val_acc5 = validate(pruned_model, val_loader, criterion, device)
+    val_criterion = nn.CrossEntropyLoss()
+    val_loss, val_acc1, val_acc5 = validate(pruned_model, val_loader, val_criterion, device)
     print(f"Epoch {epoch+1} 验证完成: Avg Loss: {val_loss:.4f}, Top-1 Acc: {val_acc1:.2f}%, Top-5 Acc: {val_acc5:.2f}%")
     
     if val_acc1 > best_acc1:
         best_acc1 = val_acc1
         best_acc5 = val_acc5
+        
         # 文件名带 Rate
         output_filename = f"re_pruner_finetuned_best_cifar10_r{RATE}.pth"
-        torch.save(pruned_model.state_dict(), output_filename)
+        if isinstance(pruned_model, nn.DataParallel):
+            # 如果是多卡，取 .module 保存，这样以后单卡也能加载
+            torch.save(pruned_model.module.state_dict(), output_filename)
+        else:
+            torch.save(pruned_model.state_dict(), output_filename)
         print(f"*** 新的最佳Top-1准确率！模型已保存到 {output_filename} ***")
 
 print("微调完成！")
