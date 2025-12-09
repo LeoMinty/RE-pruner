@@ -24,7 +24,7 @@ RATE = args.pruning_rate
 
 # --- 1. 配置 ---
 NUM_CLASSES = 10 # <---
-BATCH_SIZE = 128 * 3
+BATCH_SIZE = 128 * torch.cuda.device_count()
 FINETUNE_EPOCHS = 100
 FINETUNE_LR = 5e-4
 WEIGHT_DECAY = 1e-4    # 保持 AdamW 的默认权重衰减
