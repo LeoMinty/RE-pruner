@@ -42,7 +42,8 @@ def cleanup_ddp():
 def validate(model, loader, device_id, world_size):
     """分布式验证函数"""
     model.eval()
-    correct = torch.tensor(0.0, device=device_id)
+    top1_correct = torch.tensor(0.0, device=device_id)
+    top5_correct = torch.tensor(0.0, device=device_id)
     total = torch.tensor(0.0, device=device_id)
     
     with torch.no_grad():
@@ -51,17 +52,27 @@ def validate(model, loader, device_id, world_size):
             labels = labels.to(device_id, non_blocking=True)
             
             outputs = model(images)
-            _, preds = torch.max(outputs, 1)
             
-            correct += (preds == labels).sum()
+            
+            # Top-1
+            _, pred1 = outputs.max(1)
+            top1_correct += (pred1 == labels).sum()
+
+            # Top-5
+            _, pred5 = outputs.topk(5, dim=1, largest=True, sorted=True)
+            top5_correct += pred5.eq(labels.view(-1, 1)).sum()
             total += labels.size(0)
     
     # 在多卡模式下汇总结果
     if world_size > 1:
-        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(top1_correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(top5_correct, op=dist.ReduceOp.SUM)
         dist.all_reduce(total, op=dist.ReduceOp.SUM)
-        
-    return (100.0 * correct / total).item()
+
+    top1_acc = 100.0 * top1_correct / total
+    top5_acc = 100.0 * top5_correct / total
+
+    return top1_acc.item(), top5_acc.item()
 
 def main():
     # 1. 环境初始化
@@ -177,13 +188,16 @@ def main():
         scheduler.step()
         
         # 验证阶段
-        val_acc = validate(model, val_loader, local_rank, world_size)
+        val_top1, val_top5 = validate(model, val_loader, local_rank, world_size)
         
         if is_master:
-            print(f"Epoch {epoch+1} 完成. Val Acc: {val_acc:.2f}%")
+            print(
+        f"Epoch {epoch+1} 完成. "
+        f"Top-1 Acc: {val_top1:.2f}% | Top-5 Acc: {val_top5:.2f}%"
+    )
             
-            if val_acc > best_acc:
-                best_acc = val_acc
+            if val_top1 > best_acc:
+                best_acc = val_top1
                 save_path = "baseline_best_100class.pth"
                 # 保存时注意去掉 DDP 的 'module.' 前缀
                 state_dict = model.module.state_dict() if world_size > 1 else model.state_dict()
