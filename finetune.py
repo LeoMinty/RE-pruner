@@ -3,22 +3,33 @@ import torch
 import torch.nn as nn
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+from timm.data.mixup import Mixup
+from timm.loss import SoftTargetCrossEntropy
 import os
+import argparse
 from tqdm import tqdm
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from functools import partial
 
 # 导入 *原始* 的 ViT 基类
 from timm.models.vision_transformer import VisionTransformer, Block as TimmBlock, Attention as TimmAttention
 from timm.layers import DropPath, Mlp, to_2tuple
 
+# --- 参数解析 ---
+parser = argparse.ArgumentParser()
+parser.add_argument('--pruning_rate', type=float, default=0.4)
+args = parser.parse_args()
+RATE = args.pruning_rate
+
 # --- 1. 定义超参数和配置 ---
 NUM_CLASSES = 100 
-BATCH_SIZE = 128
-FINETUNE_EPOCHS = 20
-FINETUNE_LR = 1e-5
+BATCH_SIZE = 128 * torch.cuda.device_count()
+FINETUNE_EPOCHS = 100
+FINETUNE_LR = 5e-4
+WEIGHT_DECAY = 1e-4
 
-PRUNED_MODEL_PATH = "re_pruner_PHYSICALLY_pruned.pth"
-PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.4.pth" 
+PRUNED_MODEL_PATH = f"re_pruner_PHYSICALLY_pruned_r{RATE}.pth"
+PHASE2_MODEL_PATH = f"re_pruner_phase2_pruned_formal_theta_100class_r{RATE}.pth" 
 
 IMAGENET_SUBSET_TRAIN_PATH = "/root/autodl-tmp/imagenet100"
 IMAGENET_SUBSET_VAL_PATH = "/root/autodl-tmp/imagenet100_val" # 验证集路径
@@ -45,6 +56,18 @@ transform_val = transforms.Compose([
 val_dataset = datasets.ImageFolder(IMAGENET_SUBSET_VAL_PATH, transform=transform_val)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 print(f"训练集: {len(train_dataset)} 图像, 验证集: {len(val_dataset)} 图像。")
+
+print("正在配置 Mixup 和 CutMix...")
+mixup_fn = Mixup(
+        mixup_alpha=0.8,       # Mixup 强度
+        cutmix_alpha=1.0,      # CutMix 强度
+        cutmix_minmax=None, 
+        prob=1.0,              # 开启概率
+        switch_prob=0.5,       # Mixup 和 CutMix 切换概率
+        mode='batch',
+        label_smoothing=0.1,   # 标签平滑
+        num_classes=NUM_CLASSES
+    )
 
 # --- 3. 重建 *物理* 剪枝的模型结构 (适配 Theta) ---
 print("--- 正在重建物理剪枝模型结构 ---")
@@ -195,13 +218,26 @@ pruned_model = PrunedVisionTransformer(
 print(f"正在从 {PRUNED_MODEL_PATH} 加载 *物理* 剪枝模型权重...")
 if not os.path.exists(PRUNED_MODEL_PATH):
     raise FileNotFoundError(f"模型文件 {PRUNED_MODEL_PATH} 不存在。请先运行 prune_model.py。")
-pruned_model.load_state_dict(torch.load(PRUNED_MODEL_PATH, map_location=device))
+# pruned_model.load_state_dict(torch.load(PRUNED_MODEL_PATH, map_location=device))
+state_dict = torch.load(PRUNED_MODEL_PATH, map_location='cpu')
+pruned_model.load_state_dict(state_dict)
+
+if torch.cuda.device_count() > 1:
+    print(f"检测到 {torch.cuda.device_count()} 张显卡，已启用 DataParallel 并行加速！")
+    pruned_model = nn.DataParallel(pruned_model)
 pruned_model.to(device)
+print("模型已加载并移动到设备。")
 print("加载成功！")
 
 # --- 4. 设置优化器和损失函数 ---
-optimizer = torch.optim.AdamW(pruned_model.parameters(), lr=FINETUNE_LR) # 优化所有参数
-criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.AdamW(pruned_model.parameters(), lr=FINETUNE_LR, weight_decay=WEIGHT_DECAY) # 优化所有参数
+scheduler = CosineAnnealingLR(optimizer, T_max=FINETUNE_EPOCHS, eta_min=1e-6)
+
+# criterion = nn.CrossEntropyLoss()
+if mixup_fn is not None:
+    criterion = SoftTargetCrossEntropy()
+else:
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
 # --- 5. 验证函数 (计算Top-1和Top-5准确率) ---
 @torch.no_grad()
@@ -241,7 +277,7 @@ def validate(model, loader, criterion, device):
     return avg_loss, top1_acc, top5_acc
 
 # --- 6. 微调训练循环 ---
-print("--- 开始第三阶段 (Finetune 物理剪枝模型) ---")
+print("--- 开始第三阶段 (Finetune 物理剪枝模型(Rate: {RATE})) ---")
 best_acc1 = 0.0
 best_acc5 = 0.0
 
@@ -251,6 +287,9 @@ for epoch in range(FINETUNE_EPOCHS):
     for i, (images, labels) in enumerate(pbar):
         images, labels = images.to(device), labels.to(device)
         
+        if mixup_fn is not None:
+            images, labels = mixup_fn(images, labels)
+
         optimizer.zero_grad()
         outputs = pruned_model(images) # <-- 正常前向传播
         loss = criterion(outputs, labels)
@@ -260,15 +299,23 @@ for epoch in range(FINETUNE_EPOCHS):
         
         if i % 100 == 0:
             pbar.set_postfix({"Loss": loss.item()})
+    #更新学习率
+    scheduler.step()
+    current_lr = optimizer.param_groups[0]['lr']
 
-    val_loss, val_acc1, val_acc5 = validate(pruned_model, val_loader, criterion, device)
+    val_criterion = nn.CrossEntropyLoss()
+    val_loss, val_acc1, val_acc5 = validate(pruned_model, val_loader, val_criterion, device)
     print(f"Epoch {epoch+1} 验证完成: Avg Loss: {val_loss:.4f}, Top-1 Acc: {val_acc1:.2f}%, Top-5 Acc: {val_acc5:.2f}%")
     
     if val_acc1 > best_acc1:
         best_acc1 = val_acc1
         best_acc5 = val_acc5 
-        output_filename = f"re_pruner_finetuned_best_{NUM_CLASSES}class.pth"
-        torch.save(pruned_model.state_dict(), output_filename)
+        output_filename = f"re_pruner_finetuned_best_{NUM_CLASSES}class_r{RATE}.pth"
+        if isinstance(pruned_model, nn.DataParallel):
+            # 如果是多卡，取 .module 保存，这样以后单卡也能加载
+            torch.save(pruned_model.module.state_dict(), output_filename)
+        else:
+            torch.save(pruned_model.state_dict(), output_filename)
         print(f"*** 新的最佳Top-1准确率！模型已保存到 {output_filename} ***")
 
 print("微调完成！")
