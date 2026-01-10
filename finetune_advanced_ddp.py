@@ -25,7 +25,7 @@ PRUNED_MODEL_PATH = "re_pruner_PHYSICALLY_pruned_r0.4.pth"
 PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.4.pth"
 
 # [策略 1] 增加轮数：建议至少 100，推荐 200
-FINETUNE_EPOCHS = 100 
+FINETUNE_EPOCHS = 140 
 BATCH_SIZE_PER_GPU = 128
 # [策略 3] 基础学习率：配合 Cosine Scheduler
 BASE_LR = 5e-4 
