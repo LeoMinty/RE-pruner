@@ -3,7 +3,7 @@ import torch
 import os
 
 # --- 配置 ---
-MODEL_PATH = "re_pruner_PHYSICALLY_pruned.pth"
+MODEL_PATH = "re_pruner_PHYSICALLY_pruned_r0.5.pth"
 NUM_BLOCKS = 12
 BASE_EMBED_DIM = 384
 BASE_NUM_HEADS = 6

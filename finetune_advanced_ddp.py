@@ -21,8 +21,8 @@ from timm.layers import Mlp, DropPath
 # ================= 配置区域 =================
 # 建议从 Phase 2 后的物理模型重新开始，或者基于之前的最佳模型继续
 # 如果是继续训练，请改为 "pruned_finetuned_best_ddp.pth"
-PRUNED_MODEL_PATH = "re_pruner_PHYSICALLY_pruned_r0.4.pth" 
-PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.4.pth"
+PRUNED_MODEL_PATH = "re_pruner_PHYSICALLY_pruned_r0.5.pth" 
+PHASE2_MODEL_PATH = "re_pruner_phase2_pruned_formal_theta_100class_r0.5.pth"
 
 # [策略 1] 增加轮数：建议至少 100，推荐 200
 FINETUNE_EPOCHS = 140 
