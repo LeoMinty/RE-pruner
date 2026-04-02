@@ -19,8 +19,8 @@ from timm.models.vision_transformer import VisionTransformer, Block as TimmBlock
 from timm.layers import Mlp, DropPath
 
 # ================= 配置区域 =================
-PRUNED_MODEL_PATH = "re_pruner_physically_pruned_cifar10_r0.5.pth" 
-PHASE2_MODEL_PATH = "re_pruner_phase2_cifar10_r0.5.pth"
+PRUNED_MODEL_PATH = "re_pruner_physically_pruned_cifar10_r0.33.pth" 
+PHASE2_MODEL_PATH = "re_pruner_phase2_cifar10_r0.33.pth"
 
 FINETUNE_EPOCHS = 140 
 BATCH_SIZE_PER_GPU = 128
